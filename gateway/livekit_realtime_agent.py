@@ -63,8 +63,14 @@ except Exception:  # pragma: no cover - import checked by build_server
 HERMES_BRAIN_UNAVAILABLE_MESSAGE = (
     "Hermes brain is unavailable right now. Continue with the fast voice answer."
 )
+HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE = (
+    "Hermes Orchestrator is unavailable right now. Tell the caller the task was not submitted."
+)
 _MAX_BRAIN_QUESTION_CHARS = 4000
+_MAX_ORCHESTRATOR_TASK_CHARS = 8000
 _MAX_BRAIN_RESPONSE_CHARS = 1200
+_MAX_ORCHESTRATOR_ACK_CHARS = 600
+_PROFILE_HINT_RE = re.compile(r"^[a-zA-Z0-9_-]{0,64}$")
 _SENSITIVE_KV_RESPONSE_RE = re.compile(
     r"(?i)(api[_ -]?key|authorization|bearer|password|secret|token)\s*[:=]\s*\S+"
 )
@@ -182,8 +188,10 @@ def build_assistant_instructions(config: LiveKitVoiceConfig | None = None) -> st
         base.strip(),
         "You are in a live voice call. Speak naturally and keep turns short.",
         "If the user speaks Romanian, answer in Romanian. If the user speaks English, answer in English.",
-        "For complex planning, debugging, architecture, research synthesis, or high-stakes answers, call ask_hermes_brain before answering.",
-        "When using Hermes brain, give the caller a concise spoken summary instead of reading long analysis verbatim.",
+        "Use ask_hermes_brain only for quick deeper reasoning that can be answered inside this call.",
+        "For requests that require LLM-Wiki, Cortex, research profiles, PA/concierge profiles, coding, file/tool access, implementation, or any task to be executed after the call, call submit_to_hermes_orchestrator.",
+        "Do not claim that the phone voice model can access Wiki, Cortex, files, profiles, or tools directly.",
+        "After submitting to Hermes Orchestrator, give only a concise spoken acknowledgement and do not wait for the long result.",
     ])
 
 
@@ -418,6 +426,121 @@ def _is_loopback_host(host: str) -> bool:
     return address.is_loopback
 
 
+def build_orchestrator_task_payload(
+    task: str,
+    *,
+    profile_hint: str = "",
+    response_mode: str = "telegram",
+    config: LiveKitVoiceConfig | None = None,
+) -> dict[str, Any]:
+    """Build the async Hermes Orchestrator run payload for phone-call handoff."""
+    cfg = config or load_livekit_config()
+    clean_task = task.strip()
+    if not clean_task:
+        raise ValueError("task is required for Hermes Orchestrator")
+    clean_task = clean_task[:_MAX_ORCHESTRATOR_TASK_CHARS]
+    clean_profile = profile_hint.strip().lower()
+    if not _PROFILE_HINT_RE.match(clean_profile):
+        clean_profile = ""
+    clean_response_mode = response_mode.strip().lower() or "telegram"
+    if clean_response_mode not in {"telegram", "call_summary", "background"}:
+        clean_response_mode = "telegram"
+    profile_clause = (
+        f" Preferred profile hint from phone call: {clean_profile}."
+        if clean_profile
+        else " Let the Hermes profile router choose the right profile."
+    )
+    return {
+        "input": (
+            "PHONE VOICE HANDOFF FROM PAFI\n\n"
+            f"Task: {clean_task}\n\n"
+            f"Delivery mode requested: {clean_response_mode}.\n"
+            "Use the full Hermes Orchestrator tool stack when useful, including "
+            "LLM-Wiki, Cortex, research profiles, PA/concierge profiles, coding, "
+            "files, and external research as appropriate. "
+            f"{profile_clause} "
+            "If the task is long-running, proceed asynchronously and report back "
+            "through the normal Hermes delivery channel."
+        ),
+        "instructions": (
+            "You are Hermes Orchestrator receiving a task submitted from a live "
+            "telephone call. Treat the caller as Pafi. Route through the existing "
+            "profile router when a specialist profile is appropriate. Prefer "
+            "source-backed research for factual/research tasks. Use Cortex and "
+            "LLM-Wiki when relevant. Keep a concise status/result suitable for "
+            "Telegram delivery."
+        ),
+    }
+
+
+def is_hermes_orchestrator_url_allowed(
+    url: str,
+    *,
+    allow_remote: bool = False,
+    allowed_hosts: tuple[str, ...] = (),
+) -> bool:
+    """Return whether an Orchestrator base URL may receive the bearer token."""
+    return is_hermes_brain_url_allowed(
+        url,
+        allow_remote=allow_remote,
+        allowed_hosts=allowed_hosts,
+    )
+
+
+async def submit_to_hermes_orchestrator(
+    task: str,
+    *,
+    profile_hint: str = "",
+    response_mode: str = "telegram",
+    config: LiveKitVoiceConfig | None = None,
+    client_factory: Callable[..., Any] = httpx.AsyncClient,
+) -> str:
+    """Submit a phone-call task to the full Hermes Orchestrator asynchronously."""
+    cfg = config or load_livekit_config()
+    if not cfg.has_orchestrator_credentials:
+        return HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+    if not is_hermes_orchestrator_url_allowed(
+        cfg.hermes_orchestrator_url,
+        allow_remote=cfg.hermes_orchestrator_allow_remote,
+        allowed_hosts=cfg.hermes_orchestrator_allowed_hosts,
+    ):
+        return HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+    try:
+        payload = build_orchestrator_task_payload(
+            task,
+            profile_hint=profile_hint,
+            response_mode=response_mode,
+            config=cfg,
+        )
+    except ValueError:
+        return HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+
+    url = f"{cfg.hermes_orchestrator_url.rstrip('/')}/v1/runs"
+    headers = {
+        "Authorization": f"Bearer {cfg.hermes_orchestrator_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with client_factory(timeout=cfg.hermes_orchestrator_timeout_seconds) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        logger.warning("Hermes Orchestrator submission failed: %s", exc.__class__.__name__)
+        return HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+
+    run_id = str(data.get("run_id") or "").strip()
+    status = str(data.get("status") or "started").strip()
+    if not run_id:
+        logger.warning("Hermes Orchestrator response missing run_id")
+        return HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+    ack = (
+        f"Submitted to Hermes Orchestrator as {run_id} "
+        f"with status {status}. Give the caller a short acknowledgement."
+    )
+    return sanitize_hermes_brain_answer(ack)[:_MAX_ORCHESTRATOR_ACK_CHARS]
+
+
 async def query_hermes_brain(
     question: str,
     *,
@@ -503,6 +626,41 @@ class HermesRealtimeAssistant(Agent):  # type: ignore[misc,valid-type]
             provider=self._config.realtime_provider,
             answer_chars=len(answer or ""),
             unavailable=answer == HERMES_BRAIN_UNAVAILABLE_MESSAGE,
+        )
+        return answer
+
+    @function_tool(
+        description=(
+            "Submit real work to the full Hermes Orchestrator when the caller asks "
+            "for Wiki, Cortex, research profiles, PA/concierge profiles, coding, "
+            "tool/file access, implementation, or background task execution."
+        )
+    )
+    async def submit_to_hermes_orchestrator(
+        self,
+        task: str,
+        profile_hint: str = "",
+        response_mode: str = "telegram",
+    ) -> str:
+        started_at = time.perf_counter()
+        _log_call_event(
+            "orchestrator_submit_start",
+            provider=self._config.realtime_provider,
+            task_chars=len(task or ""),
+            profile_hint=profile_hint or "auto",
+        )
+        answer = await submit_to_hermes_orchestrator(
+            task,
+            profile_hint=profile_hint,
+            response_mode=response_mode,
+            config=self._config,
+        )
+        _log_call_event(
+            "orchestrator_submit_done",
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+            provider=self._config.realtime_provider,
+            answer_chars=len(answer or ""),
+            unavailable=answer == HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE,
         )
         return answer
 

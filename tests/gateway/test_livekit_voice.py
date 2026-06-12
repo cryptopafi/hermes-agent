@@ -10,7 +10,9 @@ import pytest
 
 from gateway.livekit_realtime_agent import (
     HERMES_BRAIN_UNAVAILABLE_MESSAGE,
+    HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE,
     HermesRealtimeAssistant,
+    build_orchestrator_task_payload,
     build_server,
     build_modular_session,
     build_hermes_brain_payload,
@@ -21,12 +23,15 @@ from gateway.livekit_realtime_agent import (
     hermes_live_voice,
     _install_session_telemetry,
     is_hermes_brain_url_allowed,
+    is_hermes_orchestrator_url_allowed,
     query_hermes_brain,
     sanitize_hermes_brain_answer,
+    submit_to_hermes_orchestrator,
 )
 from gateway.livekit_voice import (
     DEFAULT_GEMINI_REALTIME_MODEL,
     DEFAULT_HERMES_BRAIN_MODEL,
+    DEFAULT_HERMES_ORCHESTRATOR_URL,
     DEFAULT_REALTIME_MODEL,
     DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_CARTESIA_MODEL,
@@ -155,6 +160,9 @@ def test_hermes_brain_config_defaults_are_phone_safe():
     assert cfg.hermes_brain_max_tokens <= 500
     assert cfg.hermes_brain_allow_remote is False
     assert cfg.has_brain_credentials is False
+    assert cfg.hermes_orchestrator_url == DEFAULT_HERMES_ORCHESTRATOR_URL
+    assert cfg.hermes_orchestrator_allow_remote is False
+    assert cfg.has_orchestrator_credentials is False
 
 
 def test_hermes_brain_url_allows_only_trusted_hosts_by_default():
@@ -171,6 +179,59 @@ def test_hermes_brain_url_allows_only_trusted_hosts_by_default():
         allowed_hosts=("brain.example.com",),
     )
     assert not is_hermes_brain_url_allowed("http://brain.example.com/v1/chat/completions", allow_remote=True)
+
+
+def test_hermes_orchestrator_config_is_loaded_and_redacted():
+    env = {
+        "HERMES_LIVEKIT_ORCHESTRATOR_URL": "http://127.0.0.1:8642",
+        "HERMES_LIVEKIT_ORCHESTRATOR_API_KEY": "orchestrator-secret",
+        "HERMES_LIVEKIT_ORCHESTRATOR_TIMEOUT_SECONDS": "12.5",
+        "HERMES_LIVEKIT_ORCHESTRATOR_ALLOWED_HOSTS": "orch.example.com",
+    }
+    cfg = load_livekit_config(env)
+    rendered = json.dumps(cfg.public_dict(), sort_keys=True)
+
+    assert cfg.hermes_orchestrator_url == "http://127.0.0.1:8642"
+    assert cfg.hermes_orchestrator_api_key == "orchestrator-secret"
+    assert cfg.hermes_orchestrator_timeout_seconds == 12.5
+    assert cfg.hermes_orchestrator_allowed_hosts == ("orch.example.com",)
+    assert cfg.has_orchestrator_credentials is True
+    assert cfg.public_dict()["hermes_orchestrator_api_key"] == "set"
+    assert "orchestrator-secret" not in rendered
+
+
+def test_hermes_orchestrator_url_allows_only_trusted_hosts_by_default():
+    assert is_hermes_orchestrator_url_allowed("http://127.0.0.1:8642")
+    assert not is_hermes_orchestrator_url_allowed("http://10.0.0.5:8642")
+    assert not is_hermes_orchestrator_url_allowed("https://orch.example.com")
+    assert is_hermes_orchestrator_url_allowed(
+        "https://orch.example.com",
+        allow_remote=True,
+        allowed_hosts=("orch.example.com",),
+    )
+
+
+def test_orchestrator_task_payload_routes_full_work_to_orchestrator():
+    cfg = load_livekit_config({})
+    payload = build_orchestrator_task_payload(
+        "Use LLM-Wiki and Cortex to research the peptide protocol.",
+        profile_hint="hermes-research",
+        response_mode="telegram",
+        config=cfg,
+    )
+
+    assert "PHONE VOICE HANDOFF FROM PAFI" in payload["input"]
+    assert "LLM-Wiki" in payload["input"]
+    assert "Cortex" in payload["input"]
+    assert "hermes-research" in payload["input"]
+    assert "profile router" in payload["instructions"]
+    assert "source-backed research" in payload["instructions"]
+
+
+def test_orchestrator_task_payload_rejects_empty_task():
+    cfg = load_livekit_config({})
+    with pytest.raises(ValueError, match="task"):
+        build_orchestrator_task_payload("   ", config=cfg)
 
 
 def test_hermes_brain_payload_is_concise_and_non_streaming():
@@ -305,6 +366,68 @@ def test_query_hermes_brain_does_not_send_key_to_untrusted_url():
     assert answer == HERMES_BRAIN_UNAVAILABLE_MESSAGE
 
 
+def test_submit_to_hermes_orchestrator_returns_run_ack():
+    cfg = load_livekit_config({
+        "HERMES_LIVEKIT_ORCHESTRATOR_API_KEY": "fake-orchestrator-key",
+    })
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"run_id": "run_abc123", "status": "started"}
+
+    class FakeClient:
+        def __init__(self):
+            self.posted = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, *, headers, json):
+            self.posted = (url, headers, json)
+            return FakeResponse()
+
+    fake_client = FakeClient()
+    answer = asyncio.run(
+        submit_to_hermes_orchestrator(
+            "Research with Wiki and send the summary.",
+            profile_hint="hermes-research",
+            config=cfg,
+            client_factory=lambda **_: fake_client,
+        )
+    )
+
+    assert "Submitted to Hermes Orchestrator as run_abc123" in answer
+    assert fake_client.posted[0] == "http://127.0.0.1:8642/v1/runs"
+    assert fake_client.posted[1]["Authorization"] == "Bearer fake-orchestrator-key"
+    assert "Research with Wiki" in fake_client.posted[2]["input"]
+
+
+def test_submit_to_hermes_orchestrator_does_not_send_key_to_untrusted_url():
+    cfg = load_livekit_config({
+        "HERMES_LIVEKIT_ORCHESTRATOR_URL": "https://orch.example.com",
+        "HERMES_LIVEKIT_ORCHESTRATOR_API_KEY": "fake-orchestrator-key",
+    })
+
+    class FailingIfCalledClient:
+        async def __aenter__(self):
+            raise AssertionError("client must not be opened for untrusted URL")
+
+    answer = asyncio.run(
+        submit_to_hermes_orchestrator(
+            "Submit this.",
+            config=cfg,
+            client_factory=lambda **_: FailingIfCalledClient(),
+        )
+    )
+    assert answer == HERMES_ORCHESTRATOR_UNAVAILABLE_MESSAGE
+
+
 def test_realtime_assistant_registers_hermes_brain_tool():
     cfg = load_livekit_config({})
     assistant = HermesRealtimeAssistant(cfg)
@@ -313,6 +436,7 @@ def test_realtime_assistant_registers_hermes_brain_tool():
         for tool in assistant._tools
     }
     assert "ask_hermes_brain" in tool_names
+    assert "submit_to_hermes_orchestrator" in tool_names
 
 
 def test_session_telemetry_logs_redacted_events(caplog):
@@ -368,6 +492,31 @@ def test_brain_tool_logs_start_and_done(monkeypatch, caplog):
     assert answer == "answer"
     assert "hermes_call event=brain_tool_start" in caplog.text
     assert "hermes_call event=brain_tool_done" in caplog.text
+
+
+def test_orchestrator_tool_logs_start_and_done(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="gateway.livekit_realtime_agent")
+    cfg = load_livekit_config({"HERMES_LIVEKIT_REALTIME_PROVIDER": "xai"})
+    assistant = HermesRealtimeAssistant(cfg)
+
+    async def fake_submit(task, *, profile_hint, response_mode, config):
+        return "submitted"
+
+    monkeypatch.setattr(
+        "gateway.livekit_realtime_agent.submit_to_hermes_orchestrator",
+        fake_submit,
+    )
+
+    answer = asyncio.run(
+        assistant.submit_to_hermes_orchestrator(
+            "task",
+            profile_hint="hermes-research",
+        )
+    )
+
+    assert answer == "submitted"
+    assert "hermes_call event=orchestrator_submit_start" in caplog.text
+    assert "hermes_call event=orchestrator_submit_done" in caplog.text
 
 
 def test_hermes_live_voice_logs_job_and_session(monkeypatch, caplog):

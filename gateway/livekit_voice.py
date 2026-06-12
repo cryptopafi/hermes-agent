@@ -30,6 +30,8 @@ DEFAULT_HERMES_BRAIN_URL = "http://127.0.0.1:8646/v1/chat/completions"
 DEFAULT_HERMES_BRAIN_MODEL = "voice"
 DEFAULT_HERMES_BRAIN_TIMEOUT_SECONDS = 8.0
 DEFAULT_HERMES_BRAIN_MAX_TOKENS = 450
+DEFAULT_HERMES_ORCHESTRATOR_URL = "http://127.0.0.1:8642"
+DEFAULT_HERMES_ORCHESTRATOR_TIMEOUT_SECONDS = 8.0
 DEFAULT_PIPELINE_MODE = "realtime"
 DEFAULT_MODULAR_STT_PROVIDER = "deepgram"
 DEFAULT_MODULAR_TTS_PROVIDER = "cartesia"
@@ -89,6 +91,11 @@ class LiveKitVoiceConfig:
     hermes_brain_max_tokens: int = DEFAULT_HERMES_BRAIN_MAX_TOKENS
     hermes_brain_allow_remote: bool = False
     hermes_brain_allowed_hosts: tuple[str, ...] = ()
+    hermes_orchestrator_url: str = DEFAULT_HERMES_ORCHESTRATOR_URL
+    hermes_orchestrator_api_key: str = ""
+    hermes_orchestrator_timeout_seconds: float = DEFAULT_HERMES_ORCHESTRATOR_TIMEOUT_SECONDS
+    hermes_orchestrator_allow_remote: bool = False
+    hermes_orchestrator_allowed_hosts: tuple[str, ...] = ()
     realtime_enabled: bool = False
     pipeline_mode: str = DEFAULT_PIPELINE_MODE
     realtime_provider: str = DEFAULT_REALTIME_PROVIDER
@@ -176,6 +183,10 @@ class LiveKitVoiceConfig:
     def has_brain_credentials(self) -> bool:
         return bool(self.hermes_brain_url and self.hermes_brain_api_key)
 
+    @property
+    def has_orchestrator_credentials(self) -> bool:
+        return bool(self.hermes_orchestrator_url and self.hermes_orchestrator_api_key)
+
     def public_dict(self) -> dict[str, str]:
         """Return a redacted view safe for Telegram/status messages."""
         return {
@@ -217,6 +228,21 @@ class LiveKitVoiceConfig:
             else "false",
             "hermes_brain_allowed_hosts": ",".join(self.hermes_brain_allowed_hosts)
             if self.hermes_brain_allowed_hosts
+            else "none",
+            "hermes_orchestrator_url": self.hermes_orchestrator_url,
+            "hermes_orchestrator_api_key": "set"
+            if self.hermes_orchestrator_api_key
+            else "missing",
+            "hermes_orchestrator_timeout_seconds": str(
+                self.hermes_orchestrator_timeout_seconds
+            ),
+            "hermes_orchestrator_allow_remote": "true"
+            if self.hermes_orchestrator_allow_remote
+            else "false",
+            "hermes_orchestrator_allowed_hosts": ",".join(
+                self.hermes_orchestrator_allowed_hosts
+            )
+            if self.hermes_orchestrator_allowed_hosts
             else "none",
             "realtime_enabled": "true" if self.realtime_enabled else "false",
             "pipeline_mode": self.pipeline_mode,
@@ -357,6 +383,29 @@ def load_livekit_config(env: Mapping[str, str] | None = None) -> LiveKitVoiceCon
         ),
         hermes_brain_allowed_hosts=_env_csv(
             source, "HERMES_LIVEKIT_HERMES_ALLOWED_HOSTS"
+        ),
+        hermes_orchestrator_url=_env_get(
+            source,
+            "HERMES_LIVEKIT_ORCHESTRATOR_URL",
+            DEFAULT_HERMES_ORCHESTRATOR_URL,
+        ).rstrip("/"),
+        hermes_orchestrator_api_key=_env_get(
+            source,
+            "HERMES_LIVEKIT_ORCHESTRATOR_API_KEY",
+            _env_get(source, "API_SERVER_KEY"),
+        ),
+        hermes_orchestrator_timeout_seconds=_env_float(
+            source,
+            "HERMES_LIVEKIT_ORCHESTRATOR_TIMEOUT_SECONDS",
+            DEFAULT_HERMES_ORCHESTRATOR_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=30.0,
+        ),
+        hermes_orchestrator_allow_remote=_env_bool(
+            source, "HERMES_LIVEKIT_ORCHESTRATOR_ALLOW_REMOTE", False
+        ),
+        hermes_orchestrator_allowed_hosts=_env_csv(
+            source, "HERMES_LIVEKIT_ORCHESTRATOR_ALLOWED_HOSTS"
         ),
         realtime_enabled=_env_bool(source, "HERMES_LIVEKIT_REALTIME_ENABLED", False),
         pipeline_mode=_env_get(
