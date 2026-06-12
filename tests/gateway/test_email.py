@@ -605,6 +605,54 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "imap.test.com",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_DISPLAY_NAME": "Leonardo",
+        "EMAIL_DEFAULT_CC": "owner@test.com",
+    })
+    def test_reply_uses_display_name_and_default_cc(self):
+        """Configured display name and default CC should be applied to replies."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.email import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", "Hello!", None)
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "Leonardo <hermes@test.com>")
+            self.assertEqual(send_call["Cc"], "owner@test.com")
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "imap.test.com",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_DEFAULT_CC": "user@test.com, owner@test.com",
+    })
+    def test_reply_does_not_cc_direct_recipient_twice(self):
+        """Default CC should not duplicate the direct recipient."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.email import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", "Hello!", None)
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Cc"], "owner@test.com")
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
@@ -976,8 +1024,33 @@ class TestSendEmailStandalone(unittest.TestCase):
             send_call = mock_server.send_message.call_args[0][0]
             self.assertEqual(send_call["Subject"], "Hermes Agent")
             self.assertIn("Date", send_call)
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+        "EMAIL_DISPLAY_NAME": "Leonardo",
+        "EMAIL_DEFAULT_CC": "owner@test.com",
+    })
+    def test_send_email_tool_uses_display_name_and_default_cc(self):
+        """Standalone email sends should apply configured display name and CC."""
+        import asyncio
+        from tools.send_message_tool import _send_email
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(
+                _send_email({"address": "hermes@test.com", "smtp_host": "smtp.test.com"}, "user@test.com", "Hello")
+            )
+
+            self.assertTrue(result["success"])
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "Leonardo <hermes@test.com>")
+            self.assertEqual(send_call["Cc"], "owner@test.com")
             self.assertEqual(send_call["To"], "user@test.com")
-            self.assertEqual(send_call["From"], "hermes@test.com")
 
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",

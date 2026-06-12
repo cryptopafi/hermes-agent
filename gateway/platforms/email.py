@@ -11,6 +11,8 @@ Environment variables:
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
     EMAIL_ADDRESS       — Email address for the agent
     EMAIL_PASSWORD      — Email password or app-specific password
+    EMAIL_DISPLAY_NAME  — Optional display name for outbound mail
+    EMAIL_DEFAULT_CC    — Optional comma-separated CC recipients for outbound mail
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 """
@@ -28,7 +30,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formataddr, formatdate
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,6 +66,30 @@ MAX_MESSAGE_LENGTH = 50_000
 
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+def _split_addresses(raw: str) -> List[str]:
+    """Parse a comma-separated address list, dropping blanks."""
+    return [addr.strip() for addr in (raw or "").split(",") if addr.strip()]
+
+
+def _format_sender(address: str, display_name: str = "") -> str:
+    """Return a MIME-safe From header value."""
+    if display_name:
+        return formataddr((display_name, address))
+    return address
+
+
+def _add_default_cc(msg: MIMEMultipart, to_addr: str, cc_addrs: List[str]) -> None:
+    """Attach configured default CC recipients, excluding the direct recipient."""
+    if not cc_addrs:
+        return
+    filtered = [
+        addr for addr in cc_addrs
+        if addr.lower() != (to_addr or "").lower()
+    ]
+    if filtered:
+        msg["Cc"] = ", ".join(filtered)
 
 def _send_imap_id(imap: "imaplib.IMAP4") -> None:
     """Send RFC 2971 IMAP ID command identifying this client.
@@ -250,6 +276,8 @@ class EmailAdapter(BasePlatformAdapter):
 
         self._address = os.getenv("EMAIL_ADDRESS", "")
         self._password = os.getenv("EMAIL_PASSWORD", "")
+        self._display_name = os.getenv("EMAIL_DISPLAY_NAME", "").strip()
+        self._default_cc = _split_addresses(os.getenv("EMAIL_DEFAULT_CC", ""))
         self._imap_host = os.getenv("EMAIL_IMAP_HOST", "")
         self._imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
         self._smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
@@ -526,8 +554,9 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = _format_sender(self._address, self._display_name)
         msg["To"] = to_addr
+        _add_default_cc(msg, to_addr, self._default_cc)
 
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
@@ -637,8 +666,9 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = _format_sender(self._address, self._display_name)
         msg["To"] = to_addr
+        _add_default_cc(msg, to_addr, self._default_cc)
 
         ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
@@ -718,8 +748,9 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = _format_sender(self._address, self._display_name)
         msg["To"] = to_addr
+        _add_default_cc(msg, to_addr, self._default_cc)
 
         ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
