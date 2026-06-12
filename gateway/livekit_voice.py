@@ -13,6 +13,7 @@ phone-number-independent pieces of Voice v02:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ipaddress
 import json
 import os
@@ -44,6 +45,10 @@ DEFAULT_GEMINI_REALTIME_VOICE = "Puck"
 DEFAULT_XAI_REALTIME_MODEL = "grok-voice-think-fast-1.0"
 DEFAULT_XAI_REALTIME_VOICE = "ara"
 DEFAULT_REALTIME_VERSION = "v02"
+DEFAULT_OUTBOUND_PROFILE = "pa"
+DEFAULT_OUTBOUND_PARTICIPANT_NAME = "Hermes outbound callee"
+DEFAULT_OUTBOUND_DESTINATION_COUNTRY = "US"
+DEFAULT_OUTBOUND_MAX_DURATION_SECONDS = 900
 DEFAULT_REALTIME_INSTRUCTIONS = (
     "You are Hermes live voice for Pafi. Keep replies brief, useful, and natural. "
     "Reply in the user's language unless they explicitly ask otherwise. "
@@ -55,6 +60,8 @@ _SAFE_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SAFE_LIVEKIT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
+_OUTBOUND_PROFILES = {"pa", "concierge"}
+_MAX_PURPOSE_CHARS = 240
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,13 @@ class LiveKitVoiceConfig:
     room_prefix: str = DEFAULT_ROOM_PREFIX
     phone_number: str = ""
     sip_provider: str = ""
+    outbound_sip_trunk_id: str = ""
+    outbound_sip_address: str = ""
+    outbound_sip_auth_username: str = ""
+    outbound_sip_auth_password: str = ""
+    outbound_sip_from_number: str = ""
+    outbound_sip_destination_country: str = DEFAULT_OUTBOUND_DESTINATION_COUNTRY
+    outbound_sip_transport: str = ""
     hermes_brain_url: str = DEFAULT_HERMES_BRAIN_URL
     hermes_brain_api_key: str = ""
     hermes_brain_model: str = DEFAULT_HERMES_BRAIN_MODEL
@@ -104,6 +118,23 @@ class LiveKitVoiceConfig:
     @property
     def has_phone_number(self) -> bool:
         return bool(self.phone_number and _E164_RE.match(self.phone_number))
+
+    @property
+    def has_outbound_stored_trunk(self) -> bool:
+        return bool(self.outbound_sip_trunk_id)
+
+    @property
+    def has_outbound_inline_trunk(self) -> bool:
+        return bool(
+            self.outbound_sip_address
+            and self.outbound_sip_auth_username
+            and self.outbound_sip_auth_password
+            and self.outbound_sip_from_number
+        )
+
+    @property
+    def has_outbound_route(self) -> bool:
+        return self.has_outbound_stored_trunk or self.has_outbound_inline_trunk
 
     @property
     def uses_modular_pipeline(self) -> bool:
@@ -155,6 +186,25 @@ class LiveKitVoiceConfig:
             "room_prefix": self.room_prefix,
             "phone_number": self.phone_number if self.phone_number else "missing",
             "sip_provider": self.sip_provider if self.sip_provider else "missing",
+            "outbound_sip_trunk_id": "set"
+            if self.outbound_sip_trunk_id
+            else "missing",
+            "outbound_sip_address": self.outbound_sip_address
+            if self.outbound_sip_address
+            else "missing",
+            "outbound_sip_auth_username": "set"
+            if self.outbound_sip_auth_username
+            else "missing",
+            "outbound_sip_auth_password": "set"
+            if self.outbound_sip_auth_password
+            else "missing",
+            "outbound_sip_from_number": self.outbound_sip_from_number
+            if self.outbound_sip_from_number
+            else "missing",
+            "outbound_sip_destination_country": self.outbound_sip_destination_country,
+            "outbound_sip_transport": self.outbound_sip_transport
+            if self.outbound_sip_transport
+            else "missing",
             "hermes_brain_url": self.hermes_brain_url,
             "hermes_brain_api_key": "set"
             if self.hermes_brain_api_key
@@ -258,6 +308,25 @@ def load_livekit_config(env: Mapping[str, str] | None = None) -> LiveKitVoiceCon
         ),
         phone_number=_env_get(source, "HERMES_LIVEKIT_PHONE_NUMBER"),
         sip_provider=_env_get(source, "HERMES_LIVEKIT_SIP_PROVIDER"),
+        outbound_sip_trunk_id=_env_get(source, "HERMES_LIVEKIT_OUTBOUND_TRUNK_ID"),
+        outbound_sip_address=_env_get(source, "HERMES_LIVEKIT_OUTBOUND_SIP_ADDRESS"),
+        outbound_sip_auth_username=_env_get(
+            source, "HERMES_LIVEKIT_OUTBOUND_SIP_AUTH_USERNAME"
+        ),
+        outbound_sip_auth_password=_env_get(
+            source, "HERMES_LIVEKIT_OUTBOUND_SIP_AUTH_PASSWORD"
+        ),
+        outbound_sip_from_number=_env_get(
+            source, "HERMES_LIVEKIT_OUTBOUND_FROM_NUMBER"
+        ),
+        outbound_sip_destination_country=_env_get(
+            source,
+            "HERMES_LIVEKIT_OUTBOUND_DESTINATION_COUNTRY",
+            DEFAULT_OUTBOUND_DESTINATION_COUNTRY,
+        ).upper(),
+        outbound_sip_transport=_env_get(
+            source, "HERMES_LIVEKIT_OUTBOUND_SIP_TRANSPORT"
+        ).upper(),
         hermes_brain_url=_env_get(
             source, "HERMES_LIVEKIT_HERMES_URL", DEFAULT_HERMES_BRAIN_URL
         ),
@@ -375,6 +444,7 @@ def build_livekit_preflight(
     *,
     require_phone_number: bool = False,
     include_realtime: bool = False,
+    include_outbound: bool = False,
 ) -> dict[str, Any]:
     """Build a redacted readiness report for the LiveKit voice path."""
     cfg = load_livekit_config(env)
@@ -495,6 +565,9 @@ def build_livekit_preflight(
                 "message": "Set HERMES_LIVEKIT_REALTIME_ENABLED=true when ready to run the worker.",
             })
 
+    if include_outbound:
+        issues.extend(_outbound_preflight_issues(cfg))
+
     web_ready = not any(
         issue["severity"] == "error"
         and issue["code"]
@@ -509,6 +582,7 @@ def build_livekit_preflight(
     )
     realtime_ready = web_ready and (cfg.has_modular_credentials if cfg.uses_modular_pipeline else cfg.has_realtime_credentials)
     sip_ready = web_ready and cfg.has_phone_number
+    outbound_ready = web_ready and cfg.has_outbound_route
     ok = not any(issue["severity"] == "error" for issue in issues)
 
     return {
@@ -517,6 +591,7 @@ def build_livekit_preflight(
             "web_mvp": web_ready,
             "realtime_agent": realtime_ready,
             "sip_phone": sip_ready,
+            "sip_outbound": outbound_ready,
         },
         "config": cfg.public_dict(),
         "worker": build_realtime_worker_status(config=cfg),
@@ -577,6 +652,48 @@ def build_realtime_room_metadata(
     return data
 
 
+def _outbound_preflight_issues(cfg: LiveKitVoiceConfig) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    if cfg.outbound_sip_trunk_id and not _SAFE_LIVEKIT_ID_RE.match(
+        cfg.outbound_sip_trunk_id
+    ):
+        issues.append({
+            "severity": "error",
+            "code": "invalid_outbound_trunk_id",
+            "message": "HERMES_LIVEKIT_OUTBOUND_TRUNK_ID must contain only letters, digits, _ or -.",
+        })
+    if cfg.outbound_sip_from_number and not _E164_RE.match(
+        cfg.outbound_sip_from_number
+    ):
+        issues.append({
+            "severity": "error",
+            "code": "invalid_outbound_from_number",
+            "message": "HERMES_LIVEKIT_OUTBOUND_FROM_NUMBER must be in +E.164 format.",
+        })
+    if cfg.has_outbound_stored_trunk:
+        return issues
+    inline_fields = {
+        "HERMES_LIVEKIT_OUTBOUND_SIP_ADDRESS": cfg.outbound_sip_address,
+        "HERMES_LIVEKIT_OUTBOUND_SIP_AUTH_USERNAME": cfg.outbound_sip_auth_username,
+        "HERMES_LIVEKIT_OUTBOUND_SIP_AUTH_PASSWORD": cfg.outbound_sip_auth_password,
+        "HERMES_LIVEKIT_OUTBOUND_FROM_NUMBER": cfg.outbound_sip_from_number,
+    }
+    missing = [name for name, value in inline_fields.items() if not value]
+    if missing and any(inline_fields.values()):
+        issues.append({
+            "severity": "error",
+            "code": "incomplete_inline_outbound_trunk",
+            "message": "Set all inline outbound SIP fields or use HERMES_LIVEKIT_OUTBOUND_TRUNK_ID.",
+        })
+    elif missing:
+        issues.append({
+            "severity": "error",
+            "code": "missing_outbound_trunk",
+            "message": "Set HERMES_LIVEKIT_OUTBOUND_TRUNK_ID, or configure inline outbound SIP credentials.",
+        })
+    return issues
+
+
 def _next_steps(
     *, web_ready: bool, realtime_ready: bool, realtime_enabled: bool, sip_ready: bool
 ) -> list[str]:
@@ -609,6 +726,11 @@ def _safe_slug(value: str) -> str:
     clean = _SAFE_NAME_RE.sub("-", value.strip()).strip("-_").lower()
     clean = re.sub(r"-{2,}", "-", clean)
     return clean or "hermes"
+
+
+def _safe_room_name(value: str) -> str:
+    clean = _safe_slug(value)
+    return clean[:96].strip("-_") or "hermes-call"
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -723,6 +845,284 @@ def build_inbound_trunk_payload(
     return {"trunk": trunk}
 
 
+def _validate_e164(value: str, *, field_name: str) -> str:
+    phone = value.strip()
+    if not _E164_RE.match(phone):
+        raise ValueError(f"{field_name} must be in +E.164 format")
+    return phone
+
+
+def validate_outbound_profile(profile: str) -> str:
+    """Return a supported outbound-call profile or raise."""
+    clean_profile = profile.strip().lower()
+    if clean_profile not in _OUTBOUND_PROFILES:
+        raise ValueError("profile must be pa or concierge")
+    return clean_profile
+
+
+def _validate_purpose(purpose: str) -> str:
+    clean_purpose = " ".join(purpose.strip().split())
+    if not clean_purpose:
+        raise ValueError("purpose is required for outbound calls")
+    if len(clean_purpose) > _MAX_PURPOSE_CHARS:
+        raise ValueError(f"purpose must be at most {_MAX_PURPOSE_CHARS} characters")
+    return clean_purpose
+
+
+def _bounded_duration(value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_OUTBOUND_MAX_DURATION_SECONDS
+    return min(max(parsed, 30), 3600)
+
+
+def build_outbound_trunk_payload(
+    *,
+    address: str,
+    numbers: Sequence[str],
+    name: str = "Hermes live voice outbound trunk",
+    destination_country: str = DEFAULT_OUTBOUND_DESTINATION_COUNTRY,
+    transport: str = "",
+) -> dict[str, Any]:
+    """Build LiveKit outbound trunk JSON without embedding auth secrets."""
+    clean_address = address.strip()
+    if not clean_address:
+        raise ValueError("address is required")
+    clean_numbers = [_validate_e164(number, field_name="numbers") for number in numbers]
+    if not clean_numbers:
+        raise ValueError("at least one outbound trunk number is required")
+    trunk: dict[str, Any] = {
+        "name": name,
+        "address": clean_address,
+        "numbers": clean_numbers,
+    }
+    country = destination_country.strip().upper()
+    if country:
+        trunk["destinationCountry"] = country
+    clean_transport = transport.strip().upper()
+    if clean_transport:
+        trunk["transport"] = clean_transport
+    return {"trunk": trunk}
+
+
+def build_outbound_call_metadata(
+    *,
+    profile: str,
+    purpose: str,
+    requested_by: str = "pafi",
+    max_duration_seconds: int = DEFAULT_OUTBOUND_MAX_DURATION_SECONDS,
+    extra: Mapping[str, Any] | None = None,
+    config: LiveKitVoiceConfig | None = None,
+) -> dict[str, Any]:
+    """Build safe metadata shared by outbound agent dispatch and SIP participant."""
+    cfg = config or load_livekit_config()
+    metadata = build_realtime_room_metadata(
+        mode="sip-outbound",
+        extra={
+            "call_profile": validate_outbound_profile(profile),
+            "purpose": _validate_purpose(purpose),
+            "requested_by": _safe_slug(requested_by),
+            "max_duration_seconds": str(_bounded_duration(max_duration_seconds)),
+            "safety": "explicit-command-required",
+        },
+        config=cfg,
+    )
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def build_outbound_sip_participant_payload(
+    *,
+    to_number: str,
+    room_name: str,
+    participant_identity: str,
+    participant_name: str = DEFAULT_OUTBOUND_PARTICIPANT_NAME,
+    trunk_id: str = "",
+    from_number: str = "",
+    metadata: Mapping[str, Any] | None = None,
+    wait_until_answered: bool = True,
+    krisp_enabled: bool = True,
+    hide_phone_number: bool = False,
+) -> dict[str, Any]:
+    """Build LiveKit CreateSIPParticipant JSON for an outbound call."""
+    call_to = _validate_e164(to_number, field_name="to_number")
+    clean_room = _safe_room_name(room_name)
+    identity = _safe_slug(participant_identity)
+    raw_duration = (metadata or {}).get(
+        "max_duration_seconds", DEFAULT_OUTBOUND_MAX_DURATION_SECONDS
+    )
+    duration_seconds = _bounded_duration(int(raw_duration))
+    payload: dict[str, Any] = {
+        "sip_call_to": call_to,
+        "room_name": clean_room,
+        "participant_identity": identity,
+        "participant_name": participant_name.strip() or DEFAULT_OUTBOUND_PARTICIPANT_NAME,
+        "participant_metadata": _json_metadata(metadata),
+        "participant_attributes": {
+            "hermes.profile": str((metadata or {}).get("call_profile", "")),
+            "hermes.purpose": str((metadata or {}).get("purpose", "")),
+            "hermes.max_duration_seconds": str(
+                (metadata or {}).get(
+                    "max_duration_seconds", DEFAULT_OUTBOUND_MAX_DURATION_SECONDS
+                )
+            ),
+        },
+        "krisp_enabled": bool(krisp_enabled),
+        "wait_until_answered": bool(wait_until_answered),
+        "hide_phone_number": bool(hide_phone_number),
+        "max_call_duration": f"{duration_seconds}s",
+    }
+    clean_trunk_id = trunk_id.strip()
+    if clean_trunk_id:
+        if not _SAFE_LIVEKIT_ID_RE.match(clean_trunk_id):
+            raise ValueError("trunk_id must contain only letters, digits, _ or -")
+        payload["sip_trunk_id"] = clean_trunk_id
+    clean_from = from_number.strip()
+    if clean_from:
+        payload["sip_number"] = _validate_e164(clean_from, field_name="from_number")
+    if not clean_trunk_id and not clean_from:
+        raise ValueError("outbound calls require a stored trunk_id or inline from_number")
+    return payload
+
+
+def build_outbound_call_plan(
+    *,
+    to_number: str,
+    profile: str,
+    purpose: str,
+    room_name: str = "",
+    participant_identity: str = "",
+    participant_name: str = DEFAULT_OUTBOUND_PARTICIPANT_NAME,
+    trunk_id: str = "",
+    from_number: str = "",
+    requested_by: str = "pafi",
+    max_duration_seconds: int = DEFAULT_OUTBOUND_MAX_DURATION_SECONDS,
+    config: LiveKitVoiceConfig | None = None,
+) -> dict[str, Any]:
+    """Build a dry-run-safe outbound call plan."""
+    cfg = config or load_livekit_config()
+    profile_slug = validate_outbound_profile(profile)
+    room = room_name or build_room_name(cfg.room_prefix, f"{profile_slug}-outbound")
+    identity = participant_identity or f"sip-{profile_slug}-{secrets.token_hex(3)}"
+    metadata = build_outbound_call_metadata(
+        profile=profile_slug,
+        purpose=purpose,
+        requested_by=requested_by,
+        max_duration_seconds=max_duration_seconds,
+        config=cfg,
+    )
+    participant = build_outbound_sip_participant_payload(
+        to_number=to_number,
+        room_name=room,
+        participant_identity=identity,
+        participant_name=participant_name,
+        trunk_id=trunk_id or cfg.outbound_sip_trunk_id,
+        from_number=from_number or cfg.outbound_sip_from_number,
+        metadata=metadata,
+    )
+    dispatch = {
+        "agent_name": validate_agent_name(cfg.agent_name),
+        "room": participant["room_name"],
+        "metadata": _json_metadata(metadata),
+    }
+    return {
+        "mode": "dry_run",
+        "requires_execute": True,
+        "room": participant["room_name"],
+        "profile": profile_slug,
+        "to_number": _validate_e164(to_number, field_name="to_number"),
+        "metadata": metadata,
+        "agent_dispatch": dispatch,
+        "sip_participant": participant,
+        "notes": [
+            "Dry run only. Use outbound-call --execute after configuring an outbound SIP trunk.",
+            "LiveKit Phone Numbers are inbound-only; outbound calls require a SIP provider trunk.",
+        ],
+    }
+
+
+def _inline_outbound_config(cfg: LiveKitVoiceConfig) -> dict[str, str]:
+    if not cfg.has_outbound_inline_trunk:
+        return {}
+    data = {
+        "hostname": cfg.outbound_sip_address,
+        "destination_country": cfg.outbound_sip_destination_country,
+        "auth_username": cfg.outbound_sip_auth_username,
+        "auth_password": cfg.outbound_sip_auth_password,
+    }
+    if cfg.outbound_sip_transport:
+        data["transport"] = cfg.outbound_sip_transport
+    return data
+
+
+async def execute_outbound_call_plan(
+    plan: Mapping[str, Any], *, config: LiveKitVoiceConfig | None = None
+) -> dict[str, Any]:
+    """Dispatch Hermes into a room and create the outbound SIP participant."""
+    cfg = config or load_livekit_config()
+    if not cfg.has_credentials:
+        raise ValueError("LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are required")
+    participant = dict(plan.get("sip_participant") or {})
+    if not participant:
+        raise ValueError("plan must include sip_participant")
+    if not participant.get("sip_trunk_id"):
+        inline = _inline_outbound_config(cfg)
+        if not inline:
+            raise ValueError(
+                "Set HERMES_LIVEKIT_OUTBOUND_TRUNK_ID or inline outbound SIP credentials before --execute"
+            )
+    else:
+        inline = {}
+    try:
+        from livekit import api  # type: ignore
+    except Exception as exc:  # pragma: no cover - covered by operator smoke
+        raise RuntimeError("Install the livekit optional extra before dialing") from exc
+
+    lkapi = api.LiveKitAPI()
+    try:
+        dispatch = plan["agent_dispatch"]
+        await lkapi.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=dispatch["agent_name"],
+                room=dispatch["room"],
+                metadata=dispatch["metadata"],
+            )
+        )
+        request = api.CreateSIPParticipantRequest(
+            sip_trunk_id=participant.get("sip_trunk_id", ""),
+            sip_call_to=participant["sip_call_to"],
+            sip_number=participant.get("sip_number", ""),
+            room_name=participant["room_name"],
+            participant_identity=participant["participant_identity"],
+            participant_name=participant["participant_name"],
+            participant_metadata=participant["participant_metadata"],
+            participant_attributes=participant["participant_attributes"],
+            krisp_enabled=participant["krisp_enabled"],
+            wait_until_answered=participant["wait_until_answered"],
+            hide_phone_number=participant["hide_phone_number"],
+        )
+        duration_text = str(participant.get("max_call_duration", "")).rstrip("s")
+        if duration_text.isdigit():
+            request.max_call_duration.seconds = int(duration_text)
+        if inline:
+            request.trunk.CopyFrom(api.SIPOutboundConfig(**inline))
+        result = await lkapi.sip.create_sip_participant(request)
+        return {
+            "mode": "executed",
+            "room": participant["room_name"],
+            "agent_dispatch": "created",
+            "sip_participant": {
+                "participant_identity": getattr(result, "participant_identity", ""),
+                "call_status": str(getattr(result, "call_status", "")),
+                "sip_call_id": getattr(result, "sip_call_id", ""),
+            },
+        }
+    finally:
+        await lkapi.aclose()
+
+
 def create_web_participant_token(
     *,
     room_name: str,
@@ -804,6 +1204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--require-phone-number", action="store_true")
     preflight.add_argument("--include-realtime", action="store_true")
+    preflight.add_argument("--include-outbound", action="store_true")
 
     dispatch = sub.add_parser("dispatch-json")
     dispatch.add_argument("--trunk-id", action="append", default=[])
@@ -812,6 +1213,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     trunk = sub.add_parser("inbound-trunk-json")
     trunk.add_argument("--phone-number", default="")
     trunk.add_argument("--allowed-number", action="append", default=[])
+
+    outbound_trunk = sub.add_parser("outbound-trunk-json")
+    outbound_trunk.add_argument("--address", default="")
+    outbound_trunk.add_argument("--number", action="append", default=[])
+    outbound_trunk.add_argument(
+        "--destination-country", default=DEFAULT_OUTBOUND_DESTINATION_COUNTRY
+    )
+    outbound_trunk.add_argument("--transport", default="")
+
+    outbound_call_json = sub.add_parser("outbound-call-json")
+    outbound_call_json.add_argument("--to-number", required=True)
+    outbound_call_json.add_argument(
+        "--profile", choices=sorted(_OUTBOUND_PROFILES), default=DEFAULT_OUTBOUND_PROFILE
+    )
+    outbound_call_json.add_argument("--purpose", required=True)
+    outbound_call_json.add_argument("--room", default="")
+    outbound_call_json.add_argument("--identity", default="")
+    outbound_call_json.add_argument("--name", default=DEFAULT_OUTBOUND_PARTICIPANT_NAME)
+    outbound_call_json.add_argument("--trunk-id", default="")
+    outbound_call_json.add_argument("--from-number", default="")
+    outbound_call_json.add_argument(
+        "--max-duration-seconds",
+        type=int,
+        default=DEFAULT_OUTBOUND_MAX_DURATION_SECONDS,
+    )
+
+    outbound_call = sub.add_parser("outbound-call")
+    outbound_call.add_argument("--to-number", required=True)
+    outbound_call.add_argument(
+        "--profile", choices=sorted(_OUTBOUND_PROFILES), default=DEFAULT_OUTBOUND_PROFILE
+    )
+    outbound_call.add_argument("--purpose", required=True)
+    outbound_call.add_argument("--room", default="")
+    outbound_call.add_argument("--identity", default="")
+    outbound_call.add_argument("--name", default=DEFAULT_OUTBOUND_PARTICIPANT_NAME)
+    outbound_call.add_argument("--trunk-id", default="")
+    outbound_call.add_argument("--from-number", default="")
+    outbound_call.add_argument(
+        "--max-duration-seconds",
+        type=int,
+        default=DEFAULT_OUTBOUND_MAX_DURATION_SECONDS,
+    )
+    outbound_call.add_argument("--execute", action="store_true")
 
     token = sub.add_parser("room-token")
     token.add_argument("--room", default="")
@@ -830,6 +1274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             build_livekit_preflight(
                 require_phone_number=args.require_phone_number,
                 include_realtime=args.include_realtime,
+                include_outbound=args.include_outbound,
             )
         )
         return 0
@@ -848,6 +1293,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json(
             build_inbound_trunk_payload(phone, allowed_numbers=args.allowed_number)
         )
+        return 0
+    if args.command == "outbound-trunk-json":
+        numbers = args.number or ([cfg.outbound_sip_from_number] if cfg.outbound_sip_from_number else [])
+        _print_json(
+            build_outbound_trunk_payload(
+                address=args.address or cfg.outbound_sip_address,
+                numbers=numbers,
+                destination_country=args.destination_country,
+                transport=args.transport or cfg.outbound_sip_transport,
+            )
+        )
+        return 0
+    if args.command in {"outbound-call-json", "outbound-call"}:
+        plan = build_outbound_call_plan(
+            to_number=args.to_number,
+            profile=args.profile,
+            purpose=args.purpose,
+            room_name=args.room,
+            participant_identity=args.identity,
+            participant_name=args.name,
+            trunk_id=args.trunk_id,
+            from_number=args.from_number,
+            max_duration_seconds=args.max_duration_seconds,
+            config=cfg,
+        )
+        if args.command == "outbound-call-json" or not args.execute:
+            _print_json(plan)
+            return 0
+        _print_json(asyncio.run(execute_outbound_call_plan(plan, config=cfg)))
         return 0
     if args.command == "room-token":
         room = args.room or build_room_name(cfg.room_prefix, args.identity)

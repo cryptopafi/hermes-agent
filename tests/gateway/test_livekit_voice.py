@@ -34,6 +34,9 @@ from gateway.livekit_voice import (
     build_dispatch_rule_payload,
     build_inbound_trunk_payload,
     build_livekit_preflight,
+    build_outbound_call_plan,
+    build_outbound_sip_participant_payload,
+    build_outbound_trunk_payload,
     build_realtime_room_metadata,
     build_realtime_worker_status,
     build_room_name,
@@ -87,6 +90,37 @@ def test_preflight_redacts_secret_values():
     assert report["config"]["openai_api_key"] == "set"
     assert report["config"]["google_api_key"] == "missing"
     assert report["config"]["xai_api_key"] == "missing"
+
+
+def test_preflight_reports_missing_outbound_trunk_when_requested():
+    env = {
+        "LIVEKIT_URL": "wss://pafi-livekit.example.com",
+        "LIVEKIT_API_KEY": "livekit-key",
+        "LIVEKIT_API_SECRET": "livekit-secret",
+    }
+    report = build_livekit_preflight(env, include_outbound=True)
+
+    assert report["ok"] is False
+    assert report["ready"]["sip_outbound"] is False
+    assert any(issue["code"] == "missing_outbound_trunk" for issue in report["issues"])
+
+
+def test_preflight_accepts_stored_outbound_trunk_and_redacts_inline_auth():
+    env = {
+        "LIVEKIT_URL": "wss://pafi-livekit.example.com",
+        "LIVEKIT_API_KEY": "livekit-key",
+        "LIVEKIT_API_SECRET": "livekit-secret",
+        "HERMES_LIVEKIT_OUTBOUND_TRUNK_ID": "ST_safe123",
+        "HERMES_LIVEKIT_OUTBOUND_SIP_AUTH_PASSWORD": "sip-secret-password",
+    }
+    report = build_livekit_preflight(env, include_outbound=True)
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert report["ok"] is True
+    assert report["ready"]["sip_outbound"] is True
+    assert report["config"]["outbound_sip_trunk_id"] == "set"
+    assert report["config"]["outbound_sip_auth_password"] == "set"
+    assert "sip-secret-password" not in rendered
 
 
 def test_hermes_brain_config_is_loaded_and_redacted():
@@ -778,6 +812,86 @@ def test_inbound_trunk_payload_requires_e164_number():
             "allowedNumbers": ["+40741111111"],
         }
     }
+
+
+def test_outbound_trunk_payload_requires_provider_number():
+    with pytest.raises(ValueError, match="E.164"):
+        build_outbound_trunk_payload(address="sip.telnyx.com", numbers=["4842079980"])
+
+    payload = build_outbound_trunk_payload(
+        address="sip.telnyx.com",
+        numbers=["+14842079980"],
+        destination_country="US",
+    )
+
+    assert payload == {
+        "trunk": {
+            "name": "Hermes live voice outbound trunk",
+            "address": "sip.telnyx.com",
+            "numbers": ["+14842079980"],
+            "destinationCountry": "US",
+        }
+    }
+
+
+def test_outbound_sip_participant_payload_requires_trunk_or_from_number():
+    with pytest.raises(ValueError, match="trunk_id or inline from_number"):
+        build_outbound_sip_participant_payload(
+            to_number="+15551234567",
+            room_name="hermes-call-pa-test",
+            participant_identity="callee",
+            metadata={"call_profile": "pa", "purpose": "test"},
+        )
+
+
+def test_outbound_call_plan_is_dry_run_safe_and_profiled():
+    cfg = load_livekit_config({
+        "LIVEKIT_URL": "wss://pafi-livekit.example.com",
+        "LIVEKIT_API_KEY": "livekit-key",
+        "LIVEKIT_API_SECRET": "livekit-secret",
+        "HERMES_LIVEKIT_OUTBOUND_TRUNK_ID": "ST_safe123",
+        "HERMES_LIVEKIT_AGENT_NAME": "hermes-live-voice",
+    })
+
+    plan = build_outbound_call_plan(
+        to_number="+15551234567",
+        profile="concierge",
+        purpose="Book a restaurant callback",
+        room_name="hermes-call-concierge-test",
+        participant_identity="restaurant",
+        config=cfg,
+    )
+
+    assert plan["mode"] == "dry_run"
+    assert plan["requires_execute"] is True
+    assert plan["room"] == "hermes-call-concierge-test"
+    assert plan["metadata"]["call_profile"] == "concierge"
+    assert plan["agent_dispatch"]["agent_name"] == "hermes-live-voice"
+    assert plan["sip_participant"]["sip_trunk_id"] == "ST_safe123"
+    assert plan["sip_participant"]["sip_call_to"] == "+15551234567"
+    assert plan["sip_participant"]["participant_attributes"] == {
+        "hermes.profile": "concierge",
+        "hermes.purpose": "Book a restaurant callback",
+        "hermes.max_duration_seconds": "900",
+    }
+
+
+def test_outbound_call_plan_rejects_unsupported_profile_and_long_purpose():
+    cfg = load_livekit_config({"HERMES_LIVEKIT_OUTBOUND_TRUNK_ID": "ST_safe123"})
+    with pytest.raises(ValueError, match="profile"):
+        build_outbound_call_plan(
+            to_number="+15551234567",
+            profile="sales",
+            purpose="Call",
+            config=cfg,
+        )
+    with pytest.raises(ValueError, match="purpose"):
+        build_outbound_call_plan(
+            to_number="+15551234567",
+            profile="pa",
+            purpose="x" * 300,
+            config=cfg,
+        )
 
 
 def test_room_name_is_stable_safe_and_prefixed():
