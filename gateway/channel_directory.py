@@ -8,6 +8,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -73,6 +74,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
+            elif platform == Platform.EMAIL:
+                platforms["email"] = _build_email(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -144,6 +147,29 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     # Merge any DMs from session history
     channels.extend(_build_from_sessions("discord"))
     return channels
+
+
+def _build_email(adapter) -> List[Dict[str, str]]:
+    """Expose the configured email home target for send_message discovery.
+
+    Email can send to any explicit address, but the directory should still show
+    the configured home target so the model knows the platform exists.
+    """
+    home = os.getenv("EMAIL_HOME_ADDRESS", "").strip()
+    if not home:
+        return _build_from_sessions("email")
+
+    home_name = os.getenv("EMAIL_HOME_ADDRESS_NAME", "").strip() or home
+    display_name = (
+        getattr(adapter, "_display_name", "")
+        or os.getenv("EMAIL_DISPLAY_NAME", "").strip()
+        or "email"
+    )
+    return [{
+        "id": home,
+        "name": f"{home_name} via {display_name}",
+        "type": "home",
+    }]
 
 
 async def _build_slack(adapter) -> List[Dict[str, Any]]:

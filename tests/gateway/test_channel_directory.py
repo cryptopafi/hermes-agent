@@ -13,6 +13,7 @@ from gateway.channel_directory import (
     format_directory_for_display,
     load_directory,
     _build_from_sessions,
+    _build_email,
     _build_slack,
 )
 
@@ -266,6 +267,35 @@ class TestBuildFromSessions:
         assert "Coaching Chat / topic 17587" in names
 
 
+class TestBuildEmail:
+    def test_builds_configured_home_target(self):
+        adapter = SimpleNamespace(_display_name="Leonardo")
+        with patch.dict(os.environ, {
+            "EMAIL_HOME_ADDRESS": "cryptopafi@gmail.com",
+            "EMAIL_HOME_ADDRESS_NAME": "Pafi",
+        }):
+            entries = _build_email(adapter)
+
+        assert entries == [{
+            "id": "cryptopafi@gmail.com",
+            "name": "Pafi via Leonardo",
+            "type": "home",
+        }]
+
+    def test_falls_back_to_sessions_without_home_target(self, tmp_path):
+        sessions_path = tmp_path / "sessions" / "sessions.json"
+        sessions_path.parent.mkdir(parents=True)
+        sessions_path.write_text(json.dumps({
+            "s1": {"origin": {"platform": "email", "chat_id": "sender@example.com", "chat_name": "Sender"}},
+        }))
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            with patch.dict(os.environ, {"EMAIL_HOME_ADDRESS": ""}):
+                entries = _build_email(SimpleNamespace(_display_name="Leonardo"))
+
+        assert entries[0]["id"] == "sender@example.com"
+
+
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):
         with patch("gateway.channel_directory.DIRECTORY_PATH", tmp_path / "nope.json"):
@@ -302,6 +332,18 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server1):" in result
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
+
+    def test_email_display(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "email": [
+                {"id": "cryptopafi@gmail.com", "name": "Pafi via Leonardo", "type": "home"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "Email:" in result
+        assert "email:Pafi via Leonardo" in result
 
 
 class TestLookupChannelType:
