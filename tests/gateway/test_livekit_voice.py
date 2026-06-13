@@ -22,6 +22,8 @@ from gateway.livekit_realtime_agent import (
     guard_enabled_for_run,
     hermes_live_voice,
     _install_session_telemetry,
+    _build_call_context,
+    _extract_call_metadata,
     is_hermes_brain_url_allowed,
     is_hermes_orchestrator_url_allowed,
     query_hermes_brain,
@@ -537,7 +539,7 @@ def test_hermes_live_voice_logs_job_and_session(monkeypatch, caplog):
     monkeypatch.setattr("gateway.livekit_realtime_agent.AgentSession", FakeSession)
     monkeypatch.setattr(
         "gateway.livekit_realtime_agent.create_realtime_model",
-        lambda cfg: object(),
+        lambda cfg, **_: object(),
     )
     monkeypatch.setenv("HERMES_LIVEKIT_REALTIME_PROVIDER", "xai")
     ctx = types.SimpleNamespace(room=types.SimpleNamespace(name="bench-room"))
@@ -547,6 +549,99 @@ def test_hermes_live_voice_logs_job_and_session(monkeypatch, caplog):
     assert "hermes_call event=job_start" in caplog.text
     assert "room=bench-room" in caplog.text
     assert "hermes_call event=session_started" in caplog.text
+
+
+def test_outbound_call_context_from_dispatch_metadata():
+    metadata = {
+        "mode": "sip-outbound",
+        "call_profile": "pa",
+        "purpose": "Confirm the outbound call works.",
+        "max_duration_seconds": "900",
+    }
+
+    context = _build_call_context(metadata)
+
+    assert "outbound phone call initiated by Hermes" in context
+    assert "you called them" in context
+    assert "Active outbound profile: pa" in context
+    assert "Confirm the outbound call works" in context
+
+
+def test_extract_call_metadata_reads_job_and_participant_metadata():
+    ctx = types.SimpleNamespace(
+        room=types.SimpleNamespace(
+            name="room",
+            metadata="{}",
+            remote_participants={
+                "sip": types.SimpleNamespace(
+                    metadata=json.dumps({"purpose": "participant purpose"}),
+                    attributes={"hermes.profile": "concierge"},
+                )
+            },
+        ),
+        _info=types.SimpleNamespace(
+            accept_arguments=types.SimpleNamespace(
+                metadata=json.dumps({
+                    "mode": "sip-outbound",
+                    "purpose": "dispatch purpose",
+                    "call_profile": "pa",
+                })
+            )
+        ),
+    )
+
+    metadata = _extract_call_metadata(ctx)
+
+    assert metadata["mode"] == "sip-outbound"
+    assert metadata["purpose"] == "participant purpose"
+    assert metadata["call_profile"] == "pa"
+
+
+def test_hermes_live_voice_injects_outbound_context(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, *, llm):
+            self.llm = llm
+            self.callbacks = {}
+
+        def on(self, event_name, callback):
+            self.callbacks[event_name] = callback
+
+        async def start(self, *, room, agent):
+            captured["agent_instructions"] = agent._instructions
+
+    class FakeModel:
+        def __init__(self, instructions):
+            self.instructions = instructions
+
+    def fake_create_model(cfg, *, call_context=""):
+        captured["model_call_context"] = call_context
+        return FakeModel(call_context)
+
+    monkeypatch.setattr("gateway.livekit_realtime_agent.AgentSession", FakeSession)
+    monkeypatch.setattr(
+        "gateway.livekit_realtime_agent.create_realtime_model",
+        fake_create_model,
+    )
+    monkeypatch.setenv("HERMES_LIVEKIT_REALTIME_PROVIDER", "gemini")
+    ctx = types.SimpleNamespace(
+        room=types.SimpleNamespace(name="outbound-room", remote_participants={}),
+        _info=types.SimpleNamespace(
+            accept_arguments=types.SimpleNamespace(
+                metadata=json.dumps({
+                    "mode": "sip-outbound",
+                    "call_profile": "pa",
+                    "purpose": "Greet Pafi and confirm this was an outbound call.",
+                })
+            )
+        ),
+    )
+
+    asyncio.run(hermes_live_voice(ctx))
+
+    assert "outbound phone call initiated by Hermes" in captured["model_call_context"]
+    assert "you called them" in captured["agent_instructions"]
 
 
 def test_realtime_preflight_reports_missing_gemini_key_by_default():
@@ -706,6 +801,17 @@ def test_assistant_instructions_are_short_and_language_aware():
     assert "English" in instructions
 
 
+def test_assistant_instructions_include_outbound_call_context():
+    cfg = load_livekit_config({"HERMES_LIVEKIT_REALTIME_INSTRUCTIONS": "Be concise."})
+    instructions = build_assistant_instructions(
+        cfg,
+        call_context="Call context: this is an outbound phone call initiated by Hermes.",
+    )
+
+    assert "Be concise." in instructions
+    assert "outbound phone call initiated by Hermes" in instructions
+
+
 def test_realtime_worker_start_guard_requires_explicit_enable():
     cfg = load_livekit_config({})
 
@@ -769,12 +875,16 @@ def test_gemini_realtime_model_uses_config_key_and_instructions(monkeypatch):
         "HERMES_LIVEKIT_REALTIME_PROVIDER": "gemini",
         "GEMINI_API_KEY": "cfg-gemini-key",
     })
-    model = create_realtime_model(cfg)
+    model = create_realtime_model(
+        cfg,
+        call_context="Call context: this is an outbound phone call initiated by Hermes.",
+    )
 
     assert os.environ["GOOGLE_API_KEY"] == "cfg-gemini-key"
     assert model.model == DEFAULT_GEMINI_REALTIME_MODEL
     assert model.voice == "Puck"
     assert "live voice call" in model.instructions
+    assert "outbound phone call initiated by Hermes" in model.instructions
 
 
 def test_xai_realtime_model_uses_config_key(monkeypatch):

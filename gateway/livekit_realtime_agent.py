@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -97,6 +98,81 @@ def _log_call_event(event: str, **fields: Any) -> None:
     logger.info("hermes_call event=%s %s", event, safe_fields)
 
 
+def _parse_metadata(raw: Any) -> dict[str, str]:
+    """Return a small string metadata dict from LiveKit JSON metadata."""
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        data = parsed if isinstance(parsed, dict) else {}
+    else:
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in data.items()
+        if isinstance(key, str) and value is not None
+    }
+
+
+def _extract_call_metadata(ctx: Any) -> dict[str, str]:
+    """Extract room/job metadata that describes inbound vs outbound calls."""
+    merged: dict[str, str] = {}
+    room = getattr(ctx, "room", None)
+    for raw in (
+        getattr(room, "metadata", ""),
+        getattr(getattr(getattr(ctx, "_info", None), "accept_arguments", None), "metadata", ""),
+        getattr(getattr(ctx, "job", None), "metadata", ""),
+        getattr(getattr(getattr(ctx, "_info", None), "job", None), "metadata", ""),
+    ):
+        merged.update(_parse_metadata(raw))
+
+    remote_participants = getattr(room, "remote_participants", None)
+    if isinstance(remote_participants, dict):
+        participants = remote_participants.values()
+    elif remote_participants:
+        participants = remote_participants
+    else:
+        participants = ()
+    for participant in participants:
+        merged.update(_parse_metadata(getattr(participant, "metadata", "")))
+        attributes = getattr(participant, "attributes", None)
+        if isinstance(attributes, dict):
+            for key, value in attributes.items():
+                if key == "hermes.profile":
+                    merged.setdefault("call_profile", str(value))
+                elif key == "hermes.purpose":
+                    merged.setdefault("purpose", str(value))
+                elif key == "hermes.max_duration_seconds":
+                    merged.setdefault("max_duration_seconds", str(value))
+    return merged
+
+
+def _build_call_context(metadata: dict[str, str]) -> str:
+    """Build call-specific instructions from safe LiveKit metadata."""
+    mode = metadata.get("mode", "").strip()
+    if mode != "sip-outbound":
+        return ""
+    profile = metadata.get("call_profile", "").strip() or "pa"
+    purpose = metadata.get("purpose", "").strip().rstrip(".!?")
+    max_duration = metadata.get("max_duration_seconds", "").strip()
+    parts = [
+        "Call context: this is an outbound phone call initiated by Hermes for Pafi.",
+        "Do not say or imply that the caller called you; you called them.",
+        f"Active outbound profile: {profile}.",
+    ]
+    if purpose:
+        parts.append(f"Call purpose: {purpose}.")
+    if max_duration:
+        parts.append(f"Maximum planned call duration: {max_duration} seconds.")
+    parts.append(
+        "Start by briefly identifying that this is Hermes calling, then follow the call purpose."
+    )
+    return " ".join(parts)
+
+
 def _install_session_telemetry(
     session: Any,
     *,
@@ -180,11 +256,15 @@ def _install_session_telemetry(
             )
 
 
-def build_assistant_instructions(config: LiveKitVoiceConfig | None = None) -> str:
+def build_assistant_instructions(
+    config: LiveKitVoiceConfig | None = None,
+    *,
+    call_context: str = "",
+) -> str:
     """Return the short voice-agent instruction block."""
     cfg = config or load_livekit_config()
     base = cfg.realtime_instructions or DEFAULT_REALTIME_INSTRUCTIONS
-    return "\n".join([
+    lines = [
         base.strip(),
         "You are in a live voice call. Speak naturally and keep turns short.",
         "If the user speaks Romanian, answer in Romanian. If the user speaks English, answer in English.",
@@ -192,10 +272,17 @@ def build_assistant_instructions(config: LiveKitVoiceConfig | None = None) -> st
         "For requests that require LLM-Wiki, Cortex, research profiles, PA/concierge profiles, coding, file/tool access, implementation, or any task to be executed after the call, call submit_to_hermes_orchestrator.",
         "Do not claim that the phone voice model can access Wiki, Cortex, files, profiles, or tools directly.",
         "After submitting to Hermes Orchestrator, give only a concise spoken acknowledgement and do not wait for the long result.",
-    ])
+    ]
+    if call_context.strip():
+        lines.append(call_context.strip())
+    return "\n".join(lines)
 
 
-def create_realtime_model(config: LiveKitVoiceConfig | None = None) -> Any:
+def create_realtime_model(
+    config: LiveKitVoiceConfig | None = None,
+    *,
+    call_context: str = "",
+) -> Any:
     """Create the configured realtime model lazily so imports stay isolated."""
     cfg = config or load_livekit_config()
     if cfg.uses_modular_pipeline:
@@ -203,7 +290,7 @@ def create_realtime_model(config: LiveKitVoiceConfig | None = None) -> Any:
     if cfg.realtime_provider == "openai":
         return _create_openai_realtime_model(cfg)
     if cfg.realtime_provider == "gemini":
-        return _create_gemini_realtime_model(cfg)
+        return _create_gemini_realtime_model(cfg, call_context=call_context)
     if cfg.realtime_provider == "xai":
         return _create_xai_realtime_model(cfg)
     raise RuntimeError(
@@ -230,7 +317,11 @@ def _create_openai_realtime_model(cfg: LiveKitVoiceConfig) -> Any:
     )
 
 
-def _create_gemini_realtime_model(cfg: LiveKitVoiceConfig) -> Any:
+def _create_gemini_realtime_model(
+    cfg: LiveKitVoiceConfig,
+    *,
+    call_context: str = "",
+) -> Any:
     google_api_key = (
         cfg.google_api_key
         or os.environ.get("GOOGLE_API_KEY")
@@ -250,7 +341,7 @@ def _create_gemini_realtime_model(cfg: LiveKitVoiceConfig) -> Any:
     return google.realtime.RealtimeModel(
         model=cfg.realtime_model,
         voice=cfg.realtime_voice,
-        instructions=build_assistant_instructions(cfg),
+        instructions=build_assistant_instructions(cfg, call_context=call_context),
     )
 
 
@@ -601,9 +692,14 @@ def sanitize_hermes_brain_answer(text: str) -> str:
 
 
 class HermesRealtimeAssistant(Agent):  # type: ignore[misc,valid-type]
-    def __init__(self, config: LiveKitVoiceConfig) -> None:
+    def __init__(self, config: LiveKitVoiceConfig, *, call_context: str = "") -> None:
         self._config = config
-        super().__init__(instructions=build_assistant_instructions(config))
+        super().__init__(
+            instructions=build_assistant_instructions(
+                config,
+                call_context=call_context,
+            )
+        )
 
     @function_tool(
         description=(
@@ -673,25 +769,32 @@ async def hermes_live_voice(ctx: Any) -> None:
         )
     cfg = load_livekit_config()
     room_name = _room_name(ctx.room)
+    call_metadata = _extract_call_metadata(ctx)
+    call_context = _build_call_context(call_metadata)
     started_at = time.perf_counter()
     _log_call_event(
         "job_start",
         room=room_name,
         mode=cfg.pipeline_mode,
+        call_mode=call_metadata.get("mode"),
+        call_profile=call_metadata.get("call_profile"),
         provider=cfg.realtime_provider,
         stt_provider=cfg.stt_provider if cfg.uses_modular_pipeline else None,
         tts_provider=cfg.tts_provider if cfg.uses_modular_pipeline else None,
         model=cfg.realtime_model,
         voice=cfg.realtime_voice,
     )
-    session = build_modular_session(cfg) if cfg.uses_modular_pipeline else AgentSession(llm=create_realtime_model(cfg))
+    session = build_modular_session(cfg) if cfg.uses_modular_pipeline else AgentSession(llm=create_realtime_model(cfg, call_context=call_context))
     _install_session_telemetry(
         session,
         config=cfg,
         room_name=room_name,
         started_at=started_at,
     )
-    await session.start(room=ctx.room, agent=HermesRealtimeAssistant(cfg))
+    await session.start(
+        room=ctx.room,
+        agent=HermesRealtimeAssistant(cfg, call_context=call_context),
+    )
     _log_call_event(
         "session_started",
         elapsed_ms=int((time.perf_counter() - started_at) * 1000),
