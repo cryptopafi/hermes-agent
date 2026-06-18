@@ -56,6 +56,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # VPS-native WhatsApp/Telegram scrape-to-Wiki intel
+    "messaging_scrape",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -188,6 +190,12 @@ TOOLSETS = {
     "messaging": {
         "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
         "tools": ["send_message"],
+        "includes": []
+    },
+
+    "messaging_scrape": {
+        "description": "VPS-native WhatsApp/Telegram scrape-to-Wiki intel pipeline for Hermes-owned messaging context",
+        "tools": ["messaging_scrape"],
         "includes": []
     },
 
