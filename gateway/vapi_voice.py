@@ -31,6 +31,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_ENV_FILE = Path("/home/pafi/.hermes/secrets/provider.env")
 DEFAULT_EVENTS_PATH = Path("/home/pafi/.hermes/vapi_voice_events.jsonl")
 DEFAULT_ASSISTANT_NAME = "Hermes Vapi GPT41 11Labs"
+DEFAULT_CONCIERGE_ASSISTANT_NAME = "Leonardo Concierge Vapi GPT41 11Labs"
 DEFAULT_PHONE_NUMBER_NAME = "Hermes Vapi Test"
 DEFAULT_VAPI_AREA_CODE = "484"
 DEFAULT_WEBHOOK_PORT = 11437
@@ -186,6 +187,26 @@ def build_system_prompt() -> str:
     )
 
 
+def build_concierge_system_prompt() -> str:
+    return (
+        "You are Leonardo, the Concierge voice assistant for Pafi, on a live phone call. "
+        "Answer new calls with: I'm Leonardo Concierge. How can I help you? "
+        "Never introduce yourself as Hermes. Keep replies brief, natural, and useful. "
+        "Use English by default, but understand Romanian and adapt to the caller's language. "
+        "For restaurants, hotels, clubs, vendors, transport, support desks, or external parties, "
+        "use the local business language when it materially helps and you can do it safely. "
+        "You may gather information, coordinate non-payment logistics, and prepare call notes. "
+        "You must not accept or offer payments, deposits, card guarantees, purchases, bids, "
+        "subscriptions, penalties, or irreversible commitments. If one is requested, stop and say "
+        "you need owner approval. Never provide Pafi's personal phone or email; use operational "
+        "Concierge contact details only if already provided in the task. For any task that must "
+        "continue after the call, including bookings, vendor follow-up, research, LLM-Wiki, Cortex, "
+        "files, coding, or PA/concierge execution, call submit_to_hermes_orchestrator with "
+        "profile_hint concierge and the complete task. Do not respond only with 'understood' for "
+        "real tasks."
+    )
+
+
 def build_orchestrator_tool(*, webhook_url: str, webhook_token: str) -> dict[str, Any]:
     if not webhook_url:
         raise ValueError("webhook_url is required")
@@ -229,7 +250,14 @@ def build_orchestrator_tool(*, webhook_url: str, webhook_token: str) -> dict[str
     }
 
 
-def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
+def build_vapi_assistant(
+    env: Mapping[str, str],
+    *,
+    name: str,
+    first_message: str,
+    system_prompt: str,
+    transcript_assistant_name: str,
+) -> dict[str, Any]:
     webhook_url = env.get("HERMES_VAPI_WEBHOOK_URL", "").strip()
     webhook_token = env.get("HERMES_VAPI_WEBHOOK_TOKEN", "").strip()
     tools = []
@@ -242,8 +270,8 @@ def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
             "headers": {"X-Hermes-Vapi-Token": webhook_token},
         }
     payload: dict[str, Any] = {
-        "name": env.get("HERMES_VAPI_ASSISTANT_NAME", DEFAULT_ASSISTANT_NAME),
-        "firstMessage": "Hermes on Vapi. Tell me what you want me to do.",
+        "name": name,
+        "firstMessage": first_message,
         "firstMessageMode": "assistant-speaks-first",
         "transcriber": {
             "provider": "deepgram",
@@ -257,7 +285,7 @@ def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
             "model": "gpt-4.1-mini",
             "temperature": 0.2,
             "maxTokens": 220,
-            "messages": [{"role": "system", "content": build_system_prompt()}],
+            "messages": [{"role": "system", "content": system_prompt}],
             "tools": tools,
         },
         "voice": {
@@ -273,7 +301,11 @@ def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
         "artifactPlan": {
             "recordingEnabled": False,
             "loggingEnabled": True,
-            "transcriptPlan": {"enabled": True, "assistantName": "Hermes", "userName": "Pafi"},
+            "transcriptPlan": {
+                "enabled": True,
+                "assistantName": transcript_assistant_name,
+                "userName": "Pafi",
+            },
         },
         "serverMessages": [
             "tool-calls",
@@ -289,6 +321,26 @@ def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
     if server:
         payload["server"] = server
     return payload
+
+
+def build_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
+    return build_vapi_assistant(
+        env,
+        name=env.get("HERMES_VAPI_ASSISTANT_NAME", DEFAULT_ASSISTANT_NAME),
+        first_message="Hermes on Vapi. Tell me what you want me to do.",
+        system_prompt=build_system_prompt(),
+        transcript_assistant_name="Hermes",
+    )
+
+
+def build_concierge_gpt41_elevenlabs_assistant(env: Mapping[str, str]) -> dict[str, Any]:
+    return build_vapi_assistant(
+        env,
+        name=env.get("HERMES_VAPI_CONCIERGE_ASSISTANT_NAME", DEFAULT_CONCIERGE_ASSISTANT_NAME),
+        first_message="I'm Leonardo Concierge. How can I help you?",
+        system_prompt=build_concierge_system_prompt(),
+        transcript_assistant_name="Leonardo",
+    )
 
 
 def vapi_request(
@@ -320,12 +372,17 @@ def find_named(items: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
     return None
 
 
-def deploy_assistant(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
+def deploy_assistant_payload(
+    env_file: str | Path,
+    *,
+    payload_builder: Any,
+    env_id_key: str,
+) -> dict[str, Any]:
     token = ensure_webhook_token(env_file)
     env = load_env_file(env_file)
     env["HERMES_VAPI_WEBHOOK_TOKEN"] = token
     api_key = env.get("VAPI_API_KEY", "")
-    payload = build_gpt41_elevenlabs_assistant(env)
+    payload = payload_builder(env)
     name = str(payload["name"])
     existing = find_named(vapi_request("GET", "/assistant", api_key=api_key), name)
     if existing and existing.get("id"):
@@ -342,8 +399,24 @@ def deploy_assistant(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
     assistant_id = str(assistant.get("id") or (existing.get("id") if existing else "")).strip()
     if not assistant_id:
         raise RuntimeError("Vapi assistant response missing id")
-    update_env_file(env_file, {"HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID": assistant_id})
+    update_env_file(env_file, {env_id_key: assistant_id})
     return {"action": action, "assistant_id": assistant_id, "name": name}
+
+
+def deploy_assistant(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
+    return deploy_assistant_payload(
+        env_file,
+        payload_builder=build_gpt41_elevenlabs_assistant,
+        env_id_key="HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID",
+    )
+
+
+def deploy_concierge_assistant(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
+    return deploy_assistant_payload(
+        env_file,
+        payload_builder=build_concierge_gpt41_elevenlabs_assistant,
+        env_id_key="HERMES_VAPI_CONCIERGE_ASSISTANT_ID",
+    )
 
 
 def ensure_phone_number(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
@@ -387,23 +460,41 @@ def ensure_phone_number(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, An
     return {"action": action, "phone_number_id": phone_id, "number": phone.get("number", ""), "name": name}
 
 
-def create_outbound_call(target_number: str, env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
+def create_outbound_call(
+    target_number: str,
+    env_file: str | Path = DEFAULT_ENV_FILE,
+    *,
+    profile: str = "default",
+    customer_name: str = "Pafi",
+) -> dict[str, Any]:
     if not _E164_RE.match(target_number):
         raise ValueError("target_number must be E.164, for example +40758400900")
     env = load_env_file(env_file)
     api_key = env.get("VAPI_API_KEY", "")
-    assistant_id = env.get("HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID", "")
+    if profile == "default":
+        assistant_id = env.get("HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID", "")
+        call_name = "Hermes Vapi test"
+    elif profile == "concierge":
+        assistant_id = env.get("HERMES_VAPI_CONCIERGE_ASSISTANT_ID", "")
+        call_name = "Leonardo Concierge Vapi test"
+    else:
+        raise ValueError("profile must be default or concierge")
     phone_number_id = env.get("HERMES_VAPI_PHONE_NUMBER_ID", "")
     if not assistant_id or not phone_number_id:
         raise ValueError("assistant and phone number ids are required before placing calls")
     payload = {
-        "name": "Hermes Vapi test",
+        "name": call_name,
         "assistantId": assistant_id,
         "phoneNumberId": phone_number_id,
-        "customer": {"number": target_number, "name": "Pafi"},
+        "customer": {"number": target_number, "name": customer_name},
     }
     call = vapi_request("POST", "/call", api_key=api_key, payload=payload)
-    return {"call_id": call.get("id", ""), "status": call.get("status", ""), "ended_reason": call.get("endedReason", "")}
+    return {
+        "call_id": call.get("id", ""),
+        "status": call.get("status", ""),
+        "ended_reason": call.get("endedReason", ""),
+        "profile": profile,
+    }
 
 
 def append_event(event: Mapping[str, Any], *, path: str | Path | None = None) -> None:
@@ -505,7 +596,32 @@ def tool_call_parameters(tool_call: Mapping[str, Any]) -> Mapping[str, Any]:
             return {}
         if isinstance(decoded, Mapping):
             return decoded
+    function = tool_call.get("function")
+    if isinstance(function, Mapping):
+        function_params = function.get("parameters")
+        if isinstance(function_params, Mapping):
+            return function_params
+        function_args = function.get("arguments")
+        if isinstance(function_args, Mapping):
+            return function_args
+        if isinstance(function_args, str):
+            try:
+                decoded = json.loads(function_args)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(decoded, Mapping):
+                return decoded
     return {}
+
+
+def tool_call_name(tool_call: Mapping[str, Any]) -> str:
+    name = str(tool_call.get("name") or "").strip()
+    if name:
+        return name
+    function = tool_call.get("function")
+    if isinstance(function, Mapping):
+        return str(function.get("name") or "").strip()
+    return ""
 
 
 def handle_tool_calls(message: Mapping[str, Any], *, env: Mapping[str, str]) -> dict[str, Any]:
@@ -517,7 +633,7 @@ def handle_tool_calls(message: Mapping[str, Any], *, env: Mapping[str, str]) -> 
         if not isinstance(tool_call, Mapping):
             continue
         tool_id = str(tool_call.get("id") or "")
-        name = str(tool_call.get("name") or "")
+        name = tool_call_name(tool_call)
         params = tool_call_parameters(tool_call)
         if name != "submit_to_hermes_orchestrator":
             result = {"status": "rejected", "message": f"unknown tool {name}"}
@@ -609,7 +725,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("render-assistant")
+    sub.add_parser("render-concierge-assistant")
     sub.add_parser("deploy-assistant")
+    sub.add_parser("deploy-concierge-assistant")
     sub.add_parser("ensure-phone-number")
     sync = sub.add_parser("sync-webhook-url")
     sync.add_argument("--url", required=True)
@@ -621,6 +739,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     bridge.add_argument("--port", type=int, default=DEFAULT_WEBHOOK_PORT)
     call = sub.add_parser("call")
     call.add_argument("--to", required=True)
+    call.add_argument("--profile", choices=("default", "concierge"), default="default")
+    call.add_argument("--customer-name", default="Pafi")
 
     args = parser.parse_args(argv)
     env_file = Path(args.env_file)
@@ -630,8 +750,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = merged_env(env_file)
         print(json.dumps(redact_structure(build_gpt41_elevenlabs_assistant(env)), indent=2, sort_keys=True))
         return 0
+    if args.cmd == "render-concierge-assistant":
+        ensure_webhook_token(env_file)
+        env = merged_env(env_file)
+        print(json.dumps(redact_structure(build_concierge_gpt41_elevenlabs_assistant(env)), indent=2, sort_keys=True))
+        return 0
     if args.cmd == "deploy-assistant":
         print(json.dumps(deploy_assistant(env_file), indent=2, sort_keys=True))
+        return 0
+    if args.cmd == "deploy-concierge-assistant":
+        print(json.dumps(deploy_concierge_assistant(env_file), indent=2, sort_keys=True))
         return 0
     if args.cmd == "ensure-phone-number":
         print(json.dumps(ensure_phone_number(env_file), indent=2, sort_keys=True))
@@ -653,6 +781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "HERMES_LIVEKIT_ORCHESTRATOR_URL",
             "HERMES_LIVEKIT_ORCHESTRATOR_API_KEY",
             "HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID",
+            "HERMES_VAPI_CONCIERGE_ASSISTANT_ID",
         ]
         report = {
             "ok": all(env.get(key) for key in required),
@@ -673,7 +802,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_bridge(host=args.host, port=args.port, env_file=env_file)
         return 0
     if args.cmd == "call":
-        print(json.dumps(create_outbound_call(args.to, env_file), indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                create_outbound_call(
+                    args.to,
+                    env_file,
+                    profile=args.profile,
+                    customer_name=args.customer_name,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     raise AssertionError(args.cmd)
 

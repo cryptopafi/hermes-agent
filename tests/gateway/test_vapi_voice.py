@@ -22,6 +22,23 @@ def test_build_assistant_payload_uses_gpt41_mini_and_elevenlabs_flash():
     assert payload["model"]["tools"][0]["function"]["name"] == "submit_to_hermes_orchestrator"
 
 
+def test_build_concierge_assistant_uses_leonardo_identity_and_policy():
+    payload = vapi_voice.build_concierge_gpt41_elevenlabs_assistant(
+        {
+            "HERMES_VAPI_WEBHOOK_URL": "http://127.0.0.1:11437/vapi/tool",
+            "HERMES_VAPI_WEBHOOK_TOKEN": "secret-token",
+        }
+    )
+
+    system_prompt = payload["model"]["messages"][0]["content"]
+    assert payload["name"] == vapi_voice.DEFAULT_CONCIERGE_ASSISTANT_NAME
+    assert payload["firstMessage"] == "I'm Leonardo Concierge. How can I help you?"
+    assert payload["artifactPlan"]["transcriptPlan"]["assistantName"] == "Leonardo"
+    assert "Never introduce yourself as Hermes" in system_prompt
+    assert "profile_hint concierge" in system_prompt
+    assert "payments" in system_prompt
+
+
 def test_rendered_assistant_redacts_webhook_token():
     payload = vapi_voice.build_gpt41_elevenlabs_assistant(
         {
@@ -138,6 +155,33 @@ def test_tool_call_parameters_accepts_arguments_json_string():
     assert params["profile_hint"] == "research"
 
 
+def test_tool_call_parameters_accepts_vapi_nested_function_arguments():
+    params = vapi_voice.tool_call_parameters(
+        {
+            "function": {
+                "name": "submit_to_hermes_orchestrator",
+                "arguments": '{"task":"Find a restaurant in Ibiza","profile_hint":"concierge"}',
+            }
+        }
+    )
+
+    assert params["task"] == "Find a restaurant in Ibiza"
+    assert params["profile_hint"] == "concierge"
+
+
+def test_tool_call_name_accepts_vapi_nested_function_name():
+    name = vapi_voice.tool_call_name(
+        {
+            "function": {
+                "name": "submit_to_hermes_orchestrator",
+                "arguments": "{}",
+            }
+        }
+    )
+
+    assert name == "submit_to_hermes_orchestrator"
+
+
 def test_create_outbound_call_requires_e164():
     with pytest.raises(ValueError, match="E.164"):
         vapi_voice.create_outbound_call("0758400900", env_file="/missing")
@@ -158,6 +202,31 @@ def test_update_env_file_replaces_and_adds(tmp_path):
     text = env_file.read_text(encoding="utf-8")
     assert "HERMES_VAPI_WEBHOOK_TOKEN=new" in text
     assert "HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID=asst_123" in text
+
+
+def test_deploy_concierge_assistant_writes_concierge_env_key(monkeypatch, tmp_path):
+    env_file = tmp_path / "provider.env"
+    env_file.write_text(
+        "VAPI_API_KEY=vapi-key\nHERMES_VAPI_WEBHOOK_URL=http://127.0.0.1:11437/vapi/tool\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_request(method, path, *, api_key, payload=None, timeout=30.0):
+        calls.append((method, path, payload))
+        if method == "GET" and path == "/assistant":
+            return []
+        if method == "POST" and path == "/assistant":
+            return {"id": "asst_concierge_123"}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(vapi_voice, "vapi_request", fake_request)
+
+    result = vapi_voice.deploy_concierge_assistant(env_file)
+
+    assert result["assistant_id"] == "asst_concierge_123"
+    assert "HERMES_VAPI_CONCIERGE_ASSISTANT_ID=asst_concierge_123" in env_file.read_text(encoding="utf-8")
+    assert calls[-1][2]["artifactPlan"]["transcriptPlan"]["assistantName"] == "Leonardo"
 
 
 def test_ensure_phone_number_includes_area_code(monkeypatch, tmp_path):
@@ -185,6 +254,31 @@ def test_ensure_phone_number_includes_area_code(monkeypatch, tmp_path):
     assert result["phone_number_id"] == "pn_123"
     assert calls[-1][2]["numberDesiredAreaCode"] == "484"
     assert calls[-1][2]["assistantId"] == "asst_123"
+
+
+def test_create_outbound_call_uses_concierge_assistant_for_concierge_profile(monkeypatch, tmp_path):
+    env_file = tmp_path / "provider.env"
+    env_file.write_text(
+        "VAPI_API_KEY=vapi-key\n"
+        "HERMES_VAPI_GPT41_ELEVENLABS_ASSISTANT_ID=asst_generic\n"
+        "HERMES_VAPI_CONCIERGE_ASSISTANT_ID=asst_concierge\n"
+        "HERMES_VAPI_PHONE_NUMBER_ID=pn_123\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_request(method, path, *, api_key, payload=None, timeout=30.0):
+        captured["payload"] = payload
+        return {"id": "call_123", "status": "queued"}
+
+    monkeypatch.setattr(vapi_voice, "vapi_request", fake_request)
+
+    result = vapi_voice.create_outbound_call("+13022045511", env_file, profile="concierge")
+
+    assert result["profile"] == "concierge"
+    assert captured["payload"]["name"] == "Leonardo Concierge Vapi test"
+    assert captured["payload"]["assistantId"] == "asst_concierge"
+    assert captured["payload"]["phoneNumberId"] == "pn_123"
 
 
 def test_parse_content_length_rejects_missing_negative_and_oversized():
