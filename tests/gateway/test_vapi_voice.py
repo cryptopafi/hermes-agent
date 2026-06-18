@@ -35,6 +35,8 @@ def test_build_concierge_assistant_uses_leonardo_identity_and_policy():
     assert payload["firstMessage"] == "I'm Leonardo Concierge. How can I help you?"
     assert payload["artifactPlan"]["transcriptPlan"]["assistantName"] == "Leonardo"
     assert "Never introduce yourself as Hermes" in system_prompt
+    assert "Use English by default with venues and external parties" in system_prompt
+    assert "Switch to the venue's local language only if the venue" in system_prompt
     assert "profile_hint concierge" in system_prompt
     assert "payments" in system_prompt
 
