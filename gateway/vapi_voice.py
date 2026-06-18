@@ -19,6 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -35,6 +36,8 @@ DEFAULT_VAPI_AREA_CODE = "484"
 DEFAULT_WEBHOOK_PORT = 11437
 MAX_TASK_CHARS = 8000
 MAX_EVENT_BYTES = 750_000
+MAX_EVENT_LOG_BYTES = 5_000_000
+MAX_REQUEST_BYTES = 1_000_000
 
 _SAFE_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -48,6 +51,13 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bxai-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b"),
 )
+
+
+class RequestBodyError(ValueError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 def load_env_file(path: str | Path) -> dict[str, str]:
@@ -114,6 +124,36 @@ def ensure_webhook_token(env_file: str | Path = DEFAULT_ENV_FILE) -> str:
     token = secrets.token_urlsafe(32)
     update_env_file(env_file, {"HERMES_VAPI_WEBHOOK_TOKEN": token})
     return token
+
+
+def normalize_webhook_url(url: str) -> str:
+    clean = url.strip()
+    if not clean:
+        raise ValueError("webhook URL is required")
+    parsed = urlparse(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("webhook URL must be an absolute http(s) URL")
+    path = parsed.path.rstrip("/")
+    if path in {"", "/"}:
+        path = "/vapi/tool"
+    elif path != "/vapi/tool":
+        raise ValueError("webhook URL path must be /vapi/tool or a tunnel/domain root")
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def sync_webhook_url(
+    webhook_url: str,
+    *,
+    env_file: str | Path = DEFAULT_ENV_FILE,
+    deploy: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_webhook_url(webhook_url)
+    update_env_file(env_file, {"HERMES_VAPI_WEBHOOK_URL": normalized})
+    result: dict[str, Any] = {"webhook_url": normalized, "assistant_deployed": False}
+    if deploy:
+        result["assistant"] = deploy_assistant(env_file)
+        result["assistant_deployed"] = True
+    return result
 
 
 def redact_structure(value: Any, key: str = "") -> Any:
@@ -373,9 +413,48 @@ def append_event(event: Mapping[str, Any], *, path: str | Path | None = None) ->
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     if len(text.encode("utf-8")) > MAX_EVENT_BYTES:
         text = text[:MAX_EVENT_BYTES] + '"...[truncated]"}'
+    rotate_event_log(event_path, incoming_bytes=len(text.encode("utf-8")) + 1)
     with event_path.open("a", encoding="utf-8") as fh:
         fh.write(text + "\n")
     event_path.chmod(0o600)
+
+
+def rotate_event_log(
+    event_path: Path,
+    *,
+    incoming_bytes: int,
+    max_bytes: int = MAX_EVENT_LOG_BYTES,
+) -> None:
+    if max_bytes <= 0 or not event_path.exists():
+        return
+    try:
+        current_size = event_path.stat().st_size
+    except OSError:
+        return
+    if current_size + max(incoming_bytes, 0) <= max_bytes:
+        return
+    rotated = event_path.with_suffix(event_path.suffix + ".1")
+    try:
+        if rotated.exists():
+            rotated.unlink()
+        event_path.replace(rotated)
+        rotated.chmod(0o600)
+    except OSError as exc:
+        LOGGER.warning("Failed to rotate Vapi event log: %s", exc.__class__.__name__)
+
+
+def parse_content_length(raw_value: str | None, *, max_bytes: int = MAX_REQUEST_BYTES) -> int:
+    if raw_value is None or raw_value.strip() == "":
+        raise RequestBodyError(411, "content-length required")
+    try:
+        length = int(raw_value)
+    except ValueError as exc:
+        raise RequestBodyError(400, "invalid content-length") from exc
+    if length < 0:
+        raise RequestBodyError(400, "invalid content-length")
+    if length > max_bytes:
+        raise RequestBodyError(413, "request too large")
+    return length
 
 
 def submit_task_to_orchestrator(
@@ -494,8 +573,11 @@ class VapiWebhookHandler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": "unauthorized"})
             return
         try:
-            length = min(int(self.headers.get("Content-Length", "0")), 1_000_000)
+            length = parse_content_length(self.headers.get("Content-Length"))
             body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except RequestBodyError as exc:
+            self._json_response(exc.status, {"error": exc.message})
+            return
         except Exception:
             self._json_response(400, {"error": "invalid json"})
             return
@@ -529,6 +611,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("render-assistant")
     sub.add_parser("deploy-assistant")
     sub.add_parser("ensure-phone-number")
+    sync = sub.add_parser("sync-webhook-url")
+    sync.add_argument("--url", required=True)
+    sync.add_argument("--no-deploy", action="store_true")
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--json", action="store_true")
     bridge = sub.add_parser("bridge")
@@ -550,6 +635,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.cmd == "ensure-phone-number":
         print(json.dumps(ensure_phone_number(env_file), indent=2, sort_keys=True))
+        return 0
+    if args.cmd == "sync-webhook-url":
+        print(
+            json.dumps(
+                sync_webhook_url(args.url, env_file=env_file, deploy=not args.no_deploy),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     if args.cmd == "preflight":
         required = [

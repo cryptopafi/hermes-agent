@@ -185,3 +185,54 @@ def test_ensure_phone_number_includes_area_code(monkeypatch, tmp_path):
     assert result["phone_number_id"] == "pn_123"
     assert calls[-1][2]["numberDesiredAreaCode"] == "484"
     assert calls[-1][2]["assistantId"] == "asst_123"
+
+
+def test_parse_content_length_rejects_missing_negative_and_oversized():
+    with pytest.raises(vapi_voice.RequestBodyError) as missing_error:
+        vapi_voice.parse_content_length(None)
+    with pytest.raises(vapi_voice.RequestBodyError) as negative_error:
+        vapi_voice.parse_content_length("-1")
+    with pytest.raises(vapi_voice.RequestBodyError) as oversized_error:
+        vapi_voice.parse_content_length("1001", max_bytes=1000)
+
+    assert missing_error.value.status == 411
+    assert negative_error.value.status == 400
+    assert oversized_error.value.status == 413
+    assert vapi_voice.parse_content_length("42") == 42
+
+
+def test_rotate_event_log_moves_existing_file_when_limit_would_be_exceeded(tmp_path):
+    event_path = tmp_path / "events.jsonl"
+    event_path.write_text("old\n", encoding="utf-8")
+
+    vapi_voice.rotate_event_log(event_path, incoming_bytes=10, max_bytes=5)
+    vapi_voice.append_event({"type": "status-update"}, path=event_path)
+
+    assert event_path.exists()
+    assert (tmp_path / "events.jsonl.1").read_text(encoding="utf-8") == "old\n"
+    assert "status-update" in event_path.read_text(encoding="utf-8")
+
+
+def test_normalize_webhook_url_accepts_root_or_tool_path():
+    assert (
+        vapi_voice.normalize_webhook_url("https://example.trycloudflare.com")
+        == "https://example.trycloudflare.com/vapi/tool"
+    )
+    assert (
+        vapi_voice.normalize_webhook_url("https://example.trycloudflare.com/vapi/tool/")
+        == "https://example.trycloudflare.com/vapi/tool"
+    )
+    with pytest.raises(ValueError, match="http"):
+        vapi_voice.normalize_webhook_url("example.trycloudflare.com")
+    with pytest.raises(ValueError, match="/vapi/tool"):
+        vapi_voice.normalize_webhook_url("https://example.trycloudflare.com/other")
+
+
+def test_sync_webhook_url_updates_env_without_deploy(tmp_path):
+    env_file = tmp_path / "provider.env"
+    env_file.write_text("HERMES_VAPI_WEBHOOK_URL=https://old.example/vapi/tool\n", encoding="utf-8")
+
+    result = vapi_voice.sync_webhook_url("https://new.example", env_file=env_file, deploy=False)
+
+    assert result == {"webhook_url": "https://new.example/vapi/tool", "assistant_deployed": False}
+    assert "HERMES_VAPI_WEBHOOK_URL=https://new.example/vapi/tool" in env_file.read_text(encoding="utf-8")
