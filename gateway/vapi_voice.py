@@ -8,6 +8,7 @@ selected voice tasks to Hermes Orchestrator.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -23,25 +24,41 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 
-from gateway.livekit_realtime_agent import build_orchestrator_task_payload
+from gateway.livekit_realtime_agent import (
+    build_orchestrator_task_payload,
+    is_hermes_orchestrator_url_allowed,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_ENV_FILE = Path("/home/pafi/.hermes/secrets/provider.env")
 DEFAULT_EVENTS_PATH = Path("/home/pafi/.hermes/vapi_voice_events.jsonl")
+DEFAULT_CALL_LEDGER_PATH = Path("/home/pafi/.hermes/vapi_voice_calls.jsonl")
+DEFAULT_IDEMPOTENCY_DIR = Path("/home/pafi/.hermes/vapi_voice_idempotency")
+DEFAULT_AFTERCALL_TRANSCRIPT_DIR = Path("/home/pafi/.hermes/vapi_voice_aftercall_transcripts")
+DEFAULT_TESTING_TRANSCRIPT_DIR = Path("/home/pafi/.hermes/vapi_voice_testing_transcripts")
+DEFAULT_TESTING_AUDIT_DIR = Path("/home/pafi/.hermes/vapi_voice_testing_audits")
+DEFAULT_WORDING_PACKAGE_PATH = Path("/home/pafi/.hermes/vapi_voice_wording/default-wording-package.md")
 DEFAULT_ASSISTANT_NAME = "Hermes Vapi GPT41 11Labs"
 DEFAULT_CONCIERGE_ASSISTANT_NAME = "Leonardo Concierge Vapi GPT41 11Labs"
 DEFAULT_PHONE_NUMBER_NAME = "Hermes Vapi Test"
 DEFAULT_VAPI_AREA_CODE = "484"
 DEFAULT_WEBHOOK_PORT = 11437
+DEFAULT_MAX_CALL_DURATION_SECONDS = 240
+DEFAULT_SILENCE_TIMEOUT_SECONDS = 10
+DEFAULT_TOOL_TIMEOUT_SECONDS = 20
+MIN_CALL_DURATION_SECONDS = 60
+MAX_CALL_DURATION_SECONDS = 600
 MAX_TASK_CHARS = 8000
 MAX_EVENT_BYTES = 750_000
 MAX_EVENT_LOG_BYTES = 5_000_000
 MAX_REQUEST_BYTES = 1_000_000
+MAX_VAPI_VARIABLE_CHARS = 1200
 
 _SAFE_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+_VAPI_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _SECRET_KEY_RE = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|credential|bearer)"
 )
@@ -52,6 +69,37 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bxai-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b"),
 )
+
+_HOUR_WORDS = {
+    0: "twelve",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+}
+
+_MINUTE_WORDS = {
+    0: "",
+    5: "oh five",
+    10: "ten",
+    15: "fifteen",
+    20: "twenty",
+    25: "twenty five",
+    30: "thirty",
+    35: "thirty five",
+    40: "forty",
+    45: "forty five",
+    50: "fifty",
+    55: "fifty five",
+}
 
 
 class RequestBodyError(ValueError):
@@ -134,12 +182,165 @@ def normalize_webhook_url(url: str) -> str:
     parsed = urlparse(clean)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("webhook URL must be an absolute http(s) URL")
+    if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("public webhook URL must use https; http is allowed only for loopback")
     path = parsed.path.rstrip("/")
     if path in {"", "/"}:
         path = "/vapi/tool"
     elif path != "/vapi/tool":
         raise ValueError("webhook URL path must be /vapi/tool or a tunnel/domain root")
     return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def bounded_int_env(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    *,
+    min_value: int,
+    max_value: int,
+) -> int:
+    raw = str(env.get(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, value))
+
+
+def mask_e164(number: str) -> str:
+    if not _E164_RE.match(number):
+        return "[invalid-number]"
+    digits = number[1:]
+    if len(digits) <= 6:
+        return f"+{digits[0]}***{digits[-2:]}"
+    return f"+{digits[:4]}***{digits[-4:]}"
+
+
+def hash_identifier(value: str) -> str:
+    clean = value.strip()
+    if not clean:
+        return ""
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
+
+
+def clean_vapi_variable(value: str, *, max_chars: int = MAX_VAPI_VARIABLE_CHARS) -> str:
+    return " ".join(str(value or "").strip().split())[:max_chars]
+
+
+def spoken_time(value: str) -> str:
+    clean = clean_vapi_variable(value)
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", clean)
+    if not match:
+        return clean
+    hour_24 = int(match.group(1))
+    minute = int(match.group(2))
+    hour_12 = hour_24 % 12 or 12
+    suffix = "AM" if hour_24 < 12 else "PM"
+    hour_text = _HOUR_WORDS[hour_12]
+    minute_text = _MINUTE_WORDS.get(minute)
+    if minute_text is None:
+        return clean
+    if minute_text:
+        return f"{hour_text} {minute_text} {suffix}"
+    return f"{hour_text} {suffix}"
+
+
+def build_call_variable_values(
+    *,
+    purpose: str,
+    venue_name: str = "",
+    reservation_name: str = "",
+    party_size: str = "",
+    requested_time: str = "",
+    acceptable_window: str = "",
+    confirmation_email: str = "",
+    confirmation_phone: str = "",
+) -> dict[str, str]:
+    return {
+        "call_purpose": clean_vapi_variable(purpose),
+        "venue_name": clean_vapi_variable(venue_name),
+        "reservation_name": clean_vapi_variable(reservation_name),
+        "party_size": clean_vapi_variable(party_size),
+        "requested_time": clean_vapi_variable(requested_time),
+        "requested_time_spoken": spoken_time(requested_time),
+        "acceptable_window": clean_vapi_variable(acceptable_window),
+        "confirmation_email": clean_vapi_variable(confirmation_email),
+        "confirmation_phone": clean_vapi_variable(confirmation_phone),
+    }
+
+
+def build_outbound_first_message(
+    *,
+    venue_name: str,
+    reservation_name: str,
+    party_size: str,
+    requested_time: str,
+) -> str:
+    size = clean_vapi_variable(party_size) or "2"
+    time_text = spoken_time(requested_time) or "three PM"
+    return (
+        f"Hello, this is Leonardo. I'd like to arrange a table for {size} people today at {time_text}, please. Would that be possible?"
+    )
+
+
+def parse_allowed_numbers(env: Mapping[str, str]) -> set[str]:
+    allowed: set[str] = set()
+    raw = env.get("HERMES_VAPI_ALLOWED_NUMBERS", "")
+    for value in re.split(r"[\s,;]+", raw):
+        clean = value.strip()
+        if clean:
+            allowed.add(clean)
+    allowed_file = env.get("HERMES_VAPI_ALLOWED_NUMBERS_FILE", "").strip()
+    if allowed_file:
+        path = Path(allowed_file).expanduser()
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                clean = line.split("#", 1)[0].strip()
+                if clean:
+                    allowed.add(clean)
+    return {number for number in allowed if _E164_RE.match(number)}
+
+
+def approval_gate_required(env: Mapping[str, str]) -> bool:
+    value = env.get("HERMES_VAPI_REQUIRE_APPROVAL_ENVELOPE", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def truthy_env(env: Mapping[str, str], key: str, *, default: bool = False) -> bool:
+    raw = env.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def tuple_env(env: Mapping[str, str], key: str) -> tuple[str, ...]:
+    return tuple(value.strip() for value in re.split(r"[\s,;]+", env.get(key, "")) if value.strip())
+
+
+def validate_call_authorization(
+    target_number: str,
+    env: Mapping[str, str],
+    *,
+    approval_artifact_id: str,
+    idempotency_key: str,
+    require_approval_gate: bool,
+) -> dict[str, Any]:
+    allowed_numbers = parse_allowed_numbers(env)
+    if target_number not in allowed_numbers:
+        raise PermissionError("target_number is not in HERMES_VAPI_ALLOWED_NUMBERS")
+    if require_approval_gate and approval_gate_required(env):
+        if not approval_artifact_id.strip():
+            raise PermissionError("approval_artifact_id is required before placing calls")
+        if not idempotency_key.strip():
+            raise PermissionError("idempotency_key is required before placing calls")
+    return {
+        "allowed_numbers_count": len(allowed_numbers),
+        "approval_artifact_id": approval_artifact_id.strip(),
+        "idempotency_hash": hash_identifier(idempotency_key),
+    }
 
 
 def sync_webhook_url(
@@ -150,10 +351,16 @@ def sync_webhook_url(
 ) -> dict[str, Any]:
     normalized = normalize_webhook_url(webhook_url)
     update_env_file(env_file, {"HERMES_VAPI_WEBHOOK_URL": normalized})
-    result: dict[str, Any] = {"webhook_url": normalized, "assistant_deployed": False}
+    result: dict[str, Any] = {
+        "webhook_url": normalized,
+        "assistant_deployed": False,
+        "concierge_assistant_deployed": False,
+    }
     if deploy:
         result["assistant"] = deploy_assistant(env_file)
         result["assistant_deployed"] = True
+        result["concierge_assistant"] = deploy_concierge_assistant(env_file)
+        result["concierge_assistant_deployed"] = True
     return result
 
 
@@ -191,6 +398,16 @@ def build_concierge_system_prompt() -> str:
     return (
         "You are Leonardo, the Concierge voice assistant for Pafi, on a live phone call. "
         "Answer new calls with: I'm Leonardo Concierge. How can I help you? "
+        "If call variables are provided, treat them as the active outbound task: "
+        "venue={{venue_name}}, call_purpose={{call_purpose}}, reservation_name={{reservation_name}}, "
+        "party_size={{party_size}}, requested_time={{requested_time}}, "
+        "requested_time_spoken={{requested_time_spoken}}, acceptable_window={{acceptable_window}}, "
+        "confirmation_email={{confirmation_email}}, confirmation_phone={{confirmation_phone}}. "
+        "For outbound venue calls, use the Warm Concierge style by default: introduce yourself only as Leonardo, "
+        "then politely ask for exactly the reservation described by the active outbound task. Say the requested "
+        "time in natural spoken words, for example 'three PM', not '15:00'. Do not say the reservation guest's "
+        "name in the opening sentence; use it later only when the venue asks for the booking name or needs it "
+        "to complete the reservation. "
         "Never introduce yourself as Hermes. Keep replies brief, natural, and useful. "
         "Use English by default with venues and external parties. "
         "For restaurants, hotels, clubs, vendors, transport, support desks, or external parties, "
@@ -198,14 +415,24 @@ def build_concierge_system_prompt() -> str:
         "cannot or will not continue in English, or explicitly asks to use the local language. "
         "If you switch, keep the local-language exchange simple and return to English when possible. "
         "You may gather information, coordinate non-payment logistics, and prepare call notes. "
+        "If the requested time is available, confirm the date, time, party size, and reservation name, then ask "
+        "the venue to send written confirmation by email or WhatsApp using the provided operational Concierge "
+        "contact fields. If only one contact field is provided, use that one. Never provide Pafi's personal "
+        "phone or email. "
+        "If the requested time is unavailable, ask what alternatives are available, but do not accept an "
+        "alternative automatically. Say you will check and call back to confirm. End the call after collecting "
+        "the alternatives; do not ask a generic 'How can I help you?' after the booking exchange. "
+        "If this is a callback and the active task says an alternative is approved, confirm only that approved "
+        "option and then ask for written confirmation by email or WhatsApp. "
         "You must not accept or offer payments, deposits, card guarantees, purchases, bids, "
         "subscriptions, penalties, or irreversible commitments. If one is requested, stop and say "
-        "you need owner approval. Never provide Pafi's personal phone or email; use operational "
-        "Concierge contact details only if already provided in the task. For any task that must "
+        "you need approval first. For any task that must "
         "continue after the call, including bookings, vendor follow-up, research, LLM-Wiki, Cortex, "
         "files, coding, or PA/concierge execution, call submit_to_hermes_orchestrator with "
-        "profile_hint concierge and the complete task. Do not respond only with 'understood' for "
-        "real tasks."
+        "profile_hint concierge and the complete task. After the tool returns, say the task was "
+        "submitted to Hermes/Leo and that results will continue via Telegram or Hermes. Do not "
+        "claim the research, booking, follow-up, or file work is already finished unless the tool "
+        "result explicitly says it is finished. Do not respond only with 'understood' for real tasks."
     )
 
 
@@ -219,7 +446,7 @@ def build_orchestrator_tool(*, webhook_url: str, webhook_token: str) -> dict[str
         "async": False,
         "server": {
             "url": webhook_url,
-            "timeoutSeconds": 20,
+            "timeoutSeconds": DEFAULT_TOOL_TIMEOUT_SECONDS,
             "headers": {"X-Hermes-Vapi-Token": webhook_token},
         },
         "function": {
@@ -227,7 +454,8 @@ def build_orchestrator_tool(*, webhook_url: str, webhook_token: str) -> dict[str
             "description": (
                 "Submit a task from the live phone call to Hermes Orchestrator. "
                 "Use for research, LLM-Wiki/Cortex access, coding, file work, PA/concierge tasks, "
-                "or anything requiring tools beyond the voice model."
+                "or anything requiring tools beyond the voice model. The return value confirms "
+                "submission/run status; it is not proof that the background task is complete."
             ),
             "parameters": {
                 "type": "object",
@@ -262,13 +490,34 @@ def build_vapi_assistant(
 ) -> dict[str, Any]:
     webhook_url = env.get("HERMES_VAPI_WEBHOOK_URL", "").strip()
     webhook_token = env.get("HERMES_VAPI_WEBHOOK_TOKEN", "").strip()
+    max_duration_seconds = bounded_int_env(
+        env,
+        "HERMES_VAPI_MAX_DURATION_SECONDS",
+        DEFAULT_MAX_CALL_DURATION_SECONDS,
+        min_value=MIN_CALL_DURATION_SECONDS,
+        max_value=MAX_CALL_DURATION_SECONDS,
+    )
+    silence_timeout_seconds = bounded_int_env(
+        env,
+        "HERMES_VAPI_SILENCE_TIMEOUT_SECONDS",
+        DEFAULT_SILENCE_TIMEOUT_SECONDS,
+        min_value=4,
+        max_value=30,
+    )
+    tool_timeout_seconds = bounded_int_env(
+        env,
+        "HERMES_VAPI_TOOL_TIMEOUT_SECONDS",
+        DEFAULT_TOOL_TIMEOUT_SECONDS,
+        min_value=5,
+        max_value=30,
+    )
     tools = []
     server: dict[str, Any] | None = None
     if webhook_url and webhook_token:
         tools.append(build_orchestrator_tool(webhook_url=webhook_url, webhook_token=webhook_token))
         server = {
             "url": webhook_url,
-            "timeoutSeconds": 20,
+            "timeoutSeconds": tool_timeout_seconds,
             "headers": {"X-Hermes-Vapi-Token": webhook_token},
         }
     payload: dict[str, Any] = {
@@ -295,8 +544,8 @@ def build_vapi_assistant(
             "voiceId": env.get("HERMES_VAPI_ELEVENLABS_VOICE_ID", "mark"),
             "model": "eleven_flash_v2_5",
         },
-        "maxDurationSeconds": 600,
-        "silenceTimeoutSeconds": 12,
+        "maxDurationSeconds": max_duration_seconds,
+        "silenceTimeoutSeconds": silence_timeout_seconds,
         "backgroundDenoisingEnabled": True,
         "startSpeakingPlan": {"waitSeconds": 0.25},
         "stopSpeakingPlan": {"numWords": 0, "voiceSeconds": 0.2, "backoffSeconds": 0.6},
@@ -360,7 +609,7 @@ def vapi_request(
     with httpx.Client(timeout=timeout) as client:
         response = client.request(method, url, headers=headers, json=payload)
     if response.status_code >= 400:
-        detail = response.text[:500]
+        detail = str(redact_structure(response.text))[:500]
         raise RuntimeError(f"Vapi {method} {path} failed HTTP {response.status_code}: {detail}")
     if response.text:
         return response.json()
@@ -462,12 +711,126 @@ def ensure_phone_number(env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, An
     return {"action": action, "phone_number_id": phone_id, "number": phone.get("number", ""), "name": name}
 
 
+def public_webhook_preflight(
+    env_file: str | Path = DEFAULT_ENV_FILE,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    env = load_env_file(env_file)
+    webhook_url = env.get("HERMES_VAPI_WEBHOOK_URL", "").strip()
+    webhook_token = env.get("HERMES_VAPI_WEBHOOK_TOKEN", "").strip()
+    if not webhook_url or not webhook_token:
+        return {"ok": False, "error": "webhook url/token missing"}
+    try:
+        normalized = normalize_webhook_url(webhook_url)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    payload = {
+        "message": {
+            "type": "status-update",
+            "status": "preflight",
+            "source": "hermes-vapi-bridge-preflight",
+            "timestamp": time.time(),
+        }
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hermes-Vapi-Token": webhook_token,
+    }
+    try:
+        response = httpx.post(normalized, headers=headers, json=payload, timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "webhook_url": normalized, "error": exc.__class__.__name__}
+    result: dict[str, Any] = {
+        "ok": 200 <= response.status_code < 300,
+        "webhook_url": normalized,
+        "status_code": response.status_code,
+    }
+    if not result["ok"]:
+        result["error"] = response.text[:200]
+    return result
+
+
+def append_call_ledger(entry: Mapping[str, Any], *, path: str | Path | None = None) -> None:
+    ledger_path = Path(path or DEFAULT_CALL_LEDGER_PATH)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = redact_structure({"ts": time.time(), **dict(entry)})
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    with ledger_path.open("a", encoding="utf-8") as fh:
+        fh.write(text + "\n")
+    ledger_path.chmod(0o600)
+
+
+def call_ledger_has_idempotency_hash(idempotency_hash: str, *, path: str | Path | None = None) -> bool:
+    if not idempotency_hash:
+        return False
+    ledger_path = Path(path or DEFAULT_CALL_LEDGER_PATH)
+    if not ledger_path.exists():
+        return False
+    try:
+        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        authorization = entry.get("authorization") if isinstance(entry.get("authorization"), Mapping) else {}
+        if entry.get("status") == "created" and authorization.get("idempotency_hash") == idempotency_hash:
+            return True
+    return False
+
+
+def reserve_idempotency_hash(
+    idempotency_hash: str,
+    *,
+    target_number: str,
+    profile: str,
+    purpose: str,
+    path: str | Path | None = None,
+) -> Path:
+    if not idempotency_hash or not re.match(r"^[a-f0-9]{16}$", idempotency_hash):
+        raise ValueError("valid idempotency_hash is required")
+    reserve_dir = Path(path or DEFAULT_IDEMPOTENCY_DIR)
+    reserve_dir.mkdir(parents=True, exist_ok=True)
+    reserve_dir.chmod(0o700)
+    reserve_path = reserve_dir / f"{idempotency_hash}.json"
+    payload = {
+        "ts": time.time(),
+        "status": "reserved",
+        "target": mask_e164(target_number),
+        "profile": profile,
+        "purpose": purpose,
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(reserve_path, flags, 0o600)
+    except FileExistsError:
+        raise FileExistsError("idempotency_key was already reserved for a Vapi call")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")
+    return reserve_path
+
+
 def create_outbound_call(
     target_number: str,
     env_file: str | Path = DEFAULT_ENV_FILE,
     *,
     profile: str = "default",
     customer_name: str = "Pafi",
+    purpose: str = "supervised_test",
+    require_public_webhook: bool = True,
+    approval_artifact_id: str = "",
+    idempotency_key: str = "",
+    require_approval_gate: bool = True,
+    bypass_reason: str = "",
+    venue_name: str = "",
+    reservation_name: str = "",
+    party_size: str = "",
+    requested_time: str = "",
+    acceptable_window: str = "",
 ) -> dict[str, Any]:
     if not _E164_RE.match(target_number):
         raise ValueError("target_number must be E.164, for example +40758400900")
@@ -484,19 +847,119 @@ def create_outbound_call(
     phone_number_id = env.get("HERMES_VAPI_PHONE_NUMBER_ID", "")
     if not assistant_id or not phone_number_id:
         raise ValueError("assistant and phone number ids are required before placing calls")
+    authorization = validate_call_authorization(
+        target_number,
+        env,
+        approval_artifact_id=approval_artifact_id,
+        idempotency_key=idempotency_key,
+        require_approval_gate=require_approval_gate,
+    )
+    if call_ledger_has_idempotency_hash(authorization["idempotency_hash"]):
+        append_call_ledger(
+            {
+                "status": "blocked_duplicate_idempotency",
+                "profile": profile,
+                "purpose": purpose,
+                "target": mask_e164(target_number),
+                "authorization": authorization,
+            }
+        )
+        raise FileExistsError("idempotency_key was already used for a created Vapi call")
+    preflight: dict[str, Any] | None = None
+    if require_public_webhook:
+        preflight = public_webhook_preflight(env_file)
+        if not preflight.get("ok"):
+            append_call_ledger(
+                {
+                    "status": "blocked_preflight",
+                    "profile": profile,
+                    "purpose": purpose,
+                    "target": mask_e164(target_number),
+                    "authorization": authorization,
+                    "preflight": preflight,
+                }
+            )
+            raise RuntimeError(f"public webhook preflight failed: {preflight.get('error') or preflight}")
+    reserve_idempotency_hash(
+        authorization["idempotency_hash"],
+        target_number=target_number,
+        profile=profile,
+        purpose=purpose,
+    )
     payload = {
         "name": call_name,
         "assistantId": assistant_id,
         "phoneNumberId": phone_number_id,
         "customer": {"number": target_number, "name": customer_name},
+        "assistantOverrides": {
+            "firstMessage": build_outbound_first_message(
+                venue_name=venue_name,
+                reservation_name=reservation_name,
+                party_size=party_size,
+                requested_time=requested_time,
+            ),
+            "variableValues": build_call_variable_values(
+                purpose=purpose,
+                venue_name=venue_name,
+                reservation_name=reservation_name,
+                party_size=party_size,
+                requested_time=requested_time,
+                acceptable_window=acceptable_window,
+                confirmation_email=env.get("HERMES_CONCIERGE_CONFIRMATION_EMAIL", ""),
+                confirmation_phone=env.get("HERMES_CONCIERGE_CONFIRMATION_PHONE", ""),
+            )
+        },
     }
     call = vapi_request("POST", "/call", api_key=api_key, payload=payload)
-    return {
+    result = {
         "call_id": call.get("id", ""),
         "status": call.get("status", ""),
         "ended_reason": call.get("endedReason", ""),
         "profile": profile,
+        "target": mask_e164(target_number),
+        "preflight_ok": bool(preflight.get("ok")) if preflight is not None else None,
+        "approval_artifact_id": authorization["approval_artifact_id"],
+        "idempotency_hash": authorization["idempotency_hash"],
+        "bypass_reason": bypass_reason.strip(),
     }
+    append_call_ledger(
+        {
+            "status": "created",
+            "profile": profile,
+            "purpose": purpose,
+            "target": mask_e164(target_number),
+            "call_id": result["call_id"],
+            "vapi_status": result["status"],
+            "preflight_ok": result["preflight_ok"],
+            "authorization": authorization,
+            "bypass_reason": bypass_reason.strip(),
+        }
+    )
+    return result
+
+
+def get_call_status(call_id: str, env_file: str | Path = DEFAULT_ENV_FILE) -> dict[str, Any]:
+    clean_call_id = call_id.strip()
+    if not _VAPI_CALL_ID_RE.match(clean_call_id):
+        raise ValueError("call_id must contain only letters, numbers, underscores, or hyphens")
+    env = load_env_file(env_file)
+    api_key = env.get("VAPI_API_KEY", "")
+    call = vapi_request("GET", f"/call/{clean_call_id}", api_key=api_key)
+    analysis = call.get("analysis") if isinstance(call.get("analysis"), Mapping) else {}
+    metrics = call.get("performanceMetrics") if isinstance(call.get("performanceMetrics"), Mapping) else {}
+    return redact_structure(
+        {
+            "call_id": call.get("id", clean_call_id),
+            "status": call.get("status", ""),
+            "ended_reason": call.get("endedReason", ""),
+            "started_at": call.get("startedAt", ""),
+            "ended_at": call.get("endedAt", ""),
+            "cost": call.get("cost", ""),
+            "success_evaluation": analysis.get("successEvaluation"),
+            "summary": analysis.get("summary", ""),
+            "performance_metrics": metrics,
+        }
+    )
 
 
 def append_event(event: Mapping[str, Any], *, path: str | Path | None = None) -> None:
@@ -536,6 +999,271 @@ def rotate_event_log(
         LOGGER.warning("Failed to rotate Vapi event log: %s", exc.__class__.__name__)
 
 
+def summarized_vapi_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    message_type = str(message.get("type") or "")
+    call = message.get("call") if isinstance(message.get("call"), Mapping) else {}
+    analysis = message.get("analysis") if isinstance(message.get("analysis"), Mapping) else {}
+    artifact = message.get("artifact") if isinstance(message.get("artifact"), Mapping) else {}
+    transcript = str(message.get("transcript") or "")
+    messages = artifact.get("messages") if isinstance(artifact.get("messages"), list) else []
+    summary: dict[str, Any] = {
+        "type": message_type,
+        "status": message.get("status", ""),
+        "source": message.get("source", ""),
+        "call_id": call.get("id") or message.get("callId", ""),
+        "ended_reason": message.get("endedReason", ""),
+        "duration_seconds": message.get("durationSeconds", ""),
+        "cost": message.get("cost", ""),
+        "success_evaluation": analysis.get("successEvaluation"),
+        "summary": analysis.get("summary", ""),
+        "message_count": len(messages),
+        "transcript_chars": len(transcript),
+    }
+    return {key: value for key, value in summary.items() if value not in ("", None)}
+
+
+def extract_customer_number(message: Mapping[str, Any]) -> str:
+    customer = message.get("customer") if isinstance(message.get("customer"), Mapping) else {}
+    call = message.get("call") if isinstance(message.get("call"), Mapping) else {}
+    call_customer = call.get("customer") if isinstance(call.get("customer"), Mapping) else {}
+    return str(customer.get("number") or call_customer.get("number") or "").strip()
+
+
+def save_aftercall_transcript(
+    message: Mapping[str, Any],
+    *,
+    env: Mapping[str, str],
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    if not truthy_env(env, "HERMES_VAPI_SAVE_AFTERCALL_TRANSCRIPT"):
+        return {"saved": False, "reason": "disabled"}
+    transcript = str(message.get("transcript") or "").strip()
+    if not transcript:
+        return {"saved": False, "reason": "empty"}
+    customer_number = extract_customer_number(message)
+    if customer_number not in parse_allowed_numbers(env):
+        return {"saved": False, "reason": "customer_not_allowed"}
+    call = message.get("call") if isinstance(message.get("call"), Mapping) else {}
+    call_id = str(call.get("id") or message.get("callId") or "").strip()
+    if not _VAPI_CALL_ID_RE.match(call_id):
+        return {"saved": False, "reason": "invalid_call_id"}
+    transcript_dir = Path(path or DEFAULT_AFTERCALL_TRANSCRIPT_DIR)
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_dir.chmod(0o700)
+    transcript_path = transcript_dir / f"{call_id}.json"
+    payload = redact_structure(
+        {
+            "ts": time.time(),
+            "call_id": call_id,
+            "customer": mask_e164(customer_number),
+            "venue_test": True,
+            "duration_seconds": message.get("durationSeconds", ""),
+            "ended_reason": message.get("endedReason", ""),
+            "summary": message.get("summary", ""),
+            "transcript": transcript,
+        }
+    )
+    transcript_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    transcript_path.chmod(0o600)
+    return {"saved": True, "path": str(transcript_path)}
+
+
+def testing_transcript_retention_enabled(env: Mapping[str, str]) -> bool:
+    """Return true while Vapi calls are in pre-production testing mode."""
+    return truthy_env(env, "HERMES_VAPI_TESTING_TRANSCRIPT_RETENTION")
+
+
+def vapi_message_call_id(message: Mapping[str, Any]) -> str:
+    raw_call = message.get("call")
+    call: Mapping[str, Any] = raw_call if isinstance(raw_call, Mapping) else {}
+    return str(call.get("id") or message.get("callId") or "").strip()
+
+
+def save_testing_transcript_snapshot(
+    message: Mapping[str, Any],
+    *,
+    env: Mapping[str, str],
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Append full pre-production transcript artifacts for every Vapi test call event.
+
+    This intentionally stores transcript-bearing payloads separately from the compact event
+    log so testing evidence is not lost to summary-only logging or event-log rotation.
+    Disable by setting HERMES_VAPI_TESTING_TRANSCRIPT_RETENTION=false once production starts.
+    """
+    if not testing_transcript_retention_enabled(env):
+        return {"saved": False, "reason": "disabled"}
+    call_id = vapi_message_call_id(message)
+    if not _VAPI_CALL_ID_RE.match(call_id):
+        return {"saved": False, "reason": "invalid_call_id"}
+    raw_artifact = message.get("artifact")
+    artifact: Mapping[str, Any] = raw_artifact if isinstance(raw_artifact, Mapping) else {}
+    transcript = str(message.get("transcript") or artifact.get("transcript") or "").strip()
+    raw_artifact_messages = artifact.get("messages")
+    artifact_messages = raw_artifact_messages if isinstance(raw_artifact_messages, list) else []
+    if not transcript and not artifact_messages:
+        return {"saved": False, "reason": "no_transcript_payload"}
+    transcript_dir = Path(path or env.get("HERMES_VAPI_TESTING_TRANSCRIPT_DIR") or DEFAULT_TESTING_TRANSCRIPT_DIR)
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript_dir.chmod(0o700)
+    transcript_path = transcript_dir / f"{call_id}.jsonl"
+    payload = redact_structure(
+        {
+            "ts": time.time(),
+            "call_id": call_id,
+            "message_type": message.get("type", ""),
+            "customer": mask_e164(extract_customer_number(message)),
+            "duration_seconds": message.get("durationSeconds", ""),
+            "ended_reason": message.get("endedReason", ""),
+            "summary": message.get("summary", ""),
+            "analysis": message.get("analysis", {}),
+            "transcript": transcript,
+            "artifact_messages": artifact_messages,
+        }
+    )
+    with transcript_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    transcript_path.chmod(0o600)
+    audit = process_testing_transcript_audit(payload, transcript_path=transcript_path, env=env)
+    result = {"saved": True, "path": str(transcript_path)}
+    if audit.get("saved"):
+        result["audit"] = audit
+    return result
+
+
+def _keyword_present(text: str, patterns: Sequence[str]) -> bool:
+    lowered = text.lower()
+    return any(pattern.lower() in lowered for pattern in patterns)
+
+
+def _extract_wording_bullets(wording: str) -> list[str]:
+    bullets: list[str] = []
+    for line in wording.splitlines():
+        clean = line.strip()
+        if clean.startswith("- "):
+            bullets.append(clean[2:].strip())
+    return bullets[:40]
+
+
+def _line_count(text: str) -> int:
+    return len([line for line in text.splitlines() if line.strip()])
+
+
+def process_testing_transcript_audit(
+    payload: Mapping[str, Any],
+    *,
+    transcript_path: Path,
+    env: Mapping[str, str],
+) -> dict[str, Any]:
+    """Create deterministic post-call enrichment/audit/cross-reference artifacts for Vapi tests."""
+    call_id = str(payload.get("call_id") or "").strip()
+    if not _VAPI_CALL_ID_RE.match(call_id):
+        return {"saved": False, "reason": "invalid_call_id"}
+    transcript = str(payload.get("transcript") or "")
+    raw_artifact_messages = payload.get("artifact_messages")
+    artifact_messages: list[Any] = raw_artifact_messages if isinstance(raw_artifact_messages, list) else []
+    if not transcript and not artifact_messages:
+        return {"saved": False, "reason": "empty"}
+    wording_path = Path(env.get("HERMES_VAPI_DEFAULT_WORDING_PACKAGE_PATH") or DEFAULT_WORDING_PACKAGE_PATH)
+    wording = wording_path.read_text(encoding="utf-8") if wording_path.exists() else ""
+    audit_dir = Path(env.get("HERMES_VAPI_TESTING_AUDIT_DIR") or DEFAULT_TESTING_AUDIT_DIR)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.chmod(0o700)
+    audit_path = audit_dir / f"{call_id}.md"
+
+    text_for_checks = transcript or json.dumps(artifact_messages, ensure_ascii=False, default=str)
+    lower = text_for_checks.lower()
+    required_checks = {
+        "identity_and_purpose": _keyword_present(lower, ("leonardo", "hermes", "book", "reservation", "table")),
+        "availability_before_commitment": _keyword_present(lower, ("available", "availability", "do you have", "can you", "could you")),
+        "reservation_details_present": _keyword_present(lower, ("people", "party", "table")) and _keyword_present(lower, ("today", "tomorrow", ":", "pm", "am")),
+        "recap_or_confirmation": _keyword_present(lower, ("confirm", "recap", "so", "thank you")),
+        "financial_boundary_detected": _keyword_present(lower, ("deposit", "card", "prepay", "pre-payment", "payment", "guarantee", "purchase", "subscription", "bid", "crypto", "transfer")),
+        "financial_boundary_handled": _keyword_present(lower, ("no card", "no payment", "cannot", "can't", "decline", "escalate", "ask pafi", "without payment", "no deposit")),
+        "financial_commitment_made": _keyword_present(lower, ("i will pay", "we will pay", "charge the card", "you can charge", "i agree to pay", "make the payment")),
+    }
+    score = 100
+    if not required_checks["identity_and_purpose"]:
+        score -= 15
+    if not required_checks["availability_before_commitment"]:
+        score -= 15
+    if not required_checks["reservation_details_present"]:
+        score -= 15
+    if not required_checks["recap_or_confirmation"]:
+        score -= 10
+    if required_checks["financial_commitment_made"]:
+        score = 0
+    elif required_checks["financial_boundary_detected"] and not required_checks["financial_boundary_handled"]:
+        score -= 10
+    score = max(0, min(100, score))
+
+    wording_bullets = _extract_wording_bullets(wording)
+    matched_bullets = [bullet for bullet in wording_bullets if _keyword_present(lower, tuple(word.lower() for word in re.findall(r"[A-Za-z][A-Za-z-]{4,}", bullet)[:4]))]
+    missing_bullets = [bullet for bullet in wording_bullets if bullet not in matched_bullets]
+    recommendations: list[str] = []
+    if not required_checks["identity_and_purpose"]:
+        recommendations.append("Open with identity + exact booking purpose from the wording package.")
+    if not required_checks["availability_before_commitment"]:
+        recommendations.append("Ask for availability before confirming any reservation details.")
+    if not required_checks["reservation_details_present"]:
+        recommendations.append("State or capture venue, reservation name, party size, requested time, and acceptable window.")
+    if required_checks["financial_boundary_detected"] and not required_checks["financial_boundary_handled"]:
+        recommendations.append("Financial request appeared; verify the assistant declined commitment and escalated to Pafi.")
+    if required_checks["financial_commitment_made"]:
+        recommendations.append("BLOCKER: possible payment/financial commitment wording detected; do not proceed to production until fixed.")
+    if not recommendations:
+        recommendations.append("No deterministic blocker found; review transcript for tone, latency, barge-in handling, and naturalness.")
+
+    audit_payload = {
+        "call_id": call_id,
+        "ts": time.time(),
+        "score": score,
+        "transcript_path": str(transcript_path),
+        "wording_package_path": str(wording_path),
+        "transcript_chars": len(transcript),
+        "transcript_lines": _line_count(transcript),
+        "artifact_messages": len(artifact_messages),
+        "checks": required_checks,
+        "matched_wording_bullets": matched_bullets[:20],
+        "missing_wording_bullets": missing_bullets[:20],
+        "recommendations": recommendations,
+    }
+    md = [
+        f"# Vapi Test Call Audit — {call_id}",
+        "",
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
+        f"Score: {score}/100",
+        f"Transcript: `{transcript_path}`",
+        f"Wording package: `{wording_path}`",
+        "",
+        "## Enrichment",
+        f"- Transcript chars: {len(transcript)}",
+        f"- Transcript non-empty lines: {_line_count(transcript)}",
+        f"- Artifact messages: {len(artifact_messages)}",
+        "",
+        "## Audit Checks",
+    ]
+    for key, value in required_checks.items():
+        if key == "financial_commitment_made":
+            passed = not value
+        elif key == "financial_boundary_handled":
+            passed = (not required_checks["financial_boundary_detected"]) or bool(value)
+        else:
+            passed = bool(value)
+        label = "PASS" if passed else "FAIL"
+        md.append(f"- {key}: {label}")
+    md.extend(["", "## Wording Cross-reference", "Matched bullets:"])
+    md.extend([f"- {bullet}" for bullet in matched_bullets[:20]] or ["- none"])
+    md.append("Missing / needs manual review:")
+    md.extend([f"- {bullet}" for bullet in missing_bullets[:20]] or ["- none"])
+    md.extend(["", "## Optimization Recommendations"])
+    md.extend([f"- {item}" for item in recommendations])
+    md.extend(["", "## Raw JSON", "```json", json.dumps(audit_payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), "```", ""])
+    audit_path.write_text("\n".join(md), encoding="utf-8")
+    audit_path.chmod(0o600)
+    return {"saved": True, "path": str(audit_path), "score": score}
+
+
 def parse_content_length(raw_value: str | None, *, max_bytes: int = MAX_REQUEST_BYTES) -> int:
     if raw_value is None or raw_value.strip() == "":
         raise RequestBodyError(411, "content-length required")
@@ -560,10 +1288,17 @@ def submit_task_to_orchestrator(
     clean_task = task.strip()[:MAX_TASK_CHARS]
     if not clean_task:
         return {"status": "rejected", "message": "empty task"}
-    url = env.get("HERMES_LIVEKIT_ORCHESTRATOR_URL", "http://127.0.0.1:8642").rstrip("/") + "/v1/runs"
+    base_url = env.get("HERMES_LIVEKIT_ORCHESTRATOR_URL", "http://127.0.0.1:8642").rstrip("/")
     api_key = env.get("HERMES_LIVEKIT_ORCHESTRATOR_API_KEY", "")
     if not api_key:
         return {"status": "unavailable", "message": "orchestrator credentials missing"}
+    if not is_hermes_orchestrator_url_allowed(
+        base_url,
+        allow_remote=truthy_env(env, "HERMES_LIVEKIT_ORCHESTRATOR_ALLOW_REMOTE"),
+        allowed_hosts=tuple_env(env, "HERMES_LIVEKIT_ORCHESTRATOR_ALLOWED_HOSTS"),
+    ):
+        return {"status": "unavailable", "message": "orchestrator url not allowed"}
+    url = base_url + "/v1/runs"
     payload = build_orchestrator_task_payload(
         clean_task,
         profile_hint=profile_hint,
@@ -651,16 +1386,23 @@ def handle_tool_calls(message: Mapping[str, Any], *, env: Mapping[str, str]) -> 
 
 
 def handle_vapi_webhook(body: Mapping[str, Any], *, env: Mapping[str, str]) -> dict[str, Any]:
-    message = body.get("message") if isinstance(body.get("message"), Mapping) else {}
+    raw_message = body.get("message")
+    message: Mapping[str, Any] = raw_message if isinstance(raw_message, Mapping) else {}
     message_type = str(message.get("type") or "")
     if message_type == "tool-calls":
         response = handle_tool_calls(message, env=env)
         append_event({"type": "tool-calls", "response": response})
         return response
     if message_type in {"end-of-call-report", "status-update", "hang", "transcript[transcriptType=\"final\"]", "user-interrupted"}:
-        append_event({"type": message_type, "message": message})
+        event: dict[str, Any] = {"type": message_type, "message_summary": summarized_vapi_message(message)}
+        testing_snapshot = save_testing_transcript_snapshot(message, env=env)
+        if testing_snapshot.get("saved"):
+            event["testing_transcript_snapshot"] = testing_snapshot
+        if message_type == "end-of-call-report":
+            event["aftercall_transcript"] = save_aftercall_transcript(message, env=env)
+        append_event(event)
         return {"ok": True}
-    append_event({"type": message_type or "unknown", "message": message})
+    append_event({"type": message_type or "unknown", "message_summary": summarized_vapi_message(message)})
     return {"ok": True}
 
 
@@ -715,6 +1457,8 @@ def run_bridge(*, host: str, port: int, env_file: str | Path) -> None:
     env = merged_env(env_file)
     if not env.get("HERMES_VAPI_WEBHOOK_TOKEN"):
         raise RuntimeError("HERMES_VAPI_WEBHOOK_TOKEN is required")
+    if host not in {"127.0.0.1", "localhost", "::1"} and not truthy_env(env, "HERMES_VAPI_ALLOW_NON_LOOPBACK_BIND"):
+        raise RuntimeError("non-loopback bridge bind requires HERMES_VAPI_ALLOW_NON_LOOPBACK_BIND=true")
     server = HermesVapiServer((host, port), VapiWebhookHandler)
     server.env = env
     LOGGER.info("Hermes Vapi bridge listening on %s:%s", host, port)
@@ -743,6 +1487,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     call.add_argument("--to", required=True)
     call.add_argument("--profile", choices=("default", "concierge"), default="default")
     call.add_argument("--customer-name", default="Pafi")
+    call.add_argument("--purpose", default="supervised_test")
+    call.add_argument("--venue-name", default="")
+    call.add_argument("--reservation-name", default="")
+    call.add_argument("--party-size", default="")
+    call.add_argument("--requested-time", default="")
+    call.add_argument("--acceptable-window", default="")
+    call.add_argument("--approval-artifact-id", default="")
+    call.add_argument("--idempotency-key", default="")
+    call.add_argument("--skip-webhook-preflight", action="store_true")
+    call.add_argument("--skip-approval-gate", action="store_true")
+    call.add_argument("--bypass-reason", default="")
+    call_status = sub.add_parser("call-status")
+    call_status.add_argument("--call-id", required=True)
 
     args = parser.parse_args(argv)
     env_file = Path(args.env_file)
@@ -790,7 +1547,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             "required": {key: ("set" if env.get(key) else "missing") for key in required},
             "phone_number_id": "set" if env.get("HERMES_VAPI_PHONE_NUMBER_ID") else "missing",
             "phone_number": env.get("HERMES_VAPI_PHONE_NUMBER", "missing"),
+            "allowed_numbers_count": len(parse_allowed_numbers(env)),
+            "approval_gate_required": approval_gate_required(env),
+            "max_duration_seconds": bounded_int_env(
+                env,
+                "HERMES_VAPI_MAX_DURATION_SECONDS",
+                DEFAULT_MAX_CALL_DURATION_SECONDS,
+                min_value=MIN_CALL_DURATION_SECONDS,
+                max_value=MAX_CALL_DURATION_SECONDS,
+            ),
+            "silence_timeout_seconds": bounded_int_env(
+                env,
+                "HERMES_VAPI_SILENCE_TIMEOUT_SECONDS",
+                DEFAULT_SILENCE_TIMEOUT_SECONDS,
+                min_value=4,
+                max_value=30,
+            ),
         }
+        report["public_webhook"] = public_webhook_preflight(env_file) if report["ok"] else {"ok": False}
+        report["ok"] = bool(
+            report["ok"]
+            and report["public_webhook"].get("ok")
+            and report["phone_number_id"] == "set"
+            and report["allowed_numbers_count"] > 0
+        )
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -799,11 +1579,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"- {key}: {value}")
             print(f"- HERMES_VAPI_PHONE_NUMBER_ID: {report['phone_number_id']}")
             print(f"- HERMES_VAPI_PHONE_NUMBER: {report['phone_number']}")
+            print(f"- allowed numbers: {report['allowed_numbers_count']}")
+            print(f"- approval gate required: {report['approval_gate_required']}")
+            print(f"- maxDurationSeconds: {report['max_duration_seconds']}")
+            print(f"- public webhook: {'ok' if report['public_webhook'].get('ok') else 'blocked'}")
         return 0 if report["ok"] else 2
     if args.cmd == "bridge":
         run_bridge(host=args.host, port=args.port, env_file=env_file)
         return 0
     if args.cmd == "call":
+        bypass_requested = bool(args.skip_webhook_preflight or args.skip_approval_gate)
+        if bypass_requested:
+            if not truthy_env(env, "HERMES_VAPI_ALLOW_TEST_BYPASS"):
+                parser.error("bypass flags require HERMES_VAPI_ALLOW_TEST_BYPASS=true")
+            if not args.bypass_reason.strip():
+                parser.error("--bypass-reason is required when using bypass flags")
         print(
             json.dumps(
                 create_outbound_call(
@@ -811,11 +1601,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     env_file,
                     profile=args.profile,
                     customer_name=args.customer_name,
+                    purpose=args.purpose,
+                    require_public_webhook=not args.skip_webhook_preflight,
+                    approval_artifact_id=args.approval_artifact_id,
+                    idempotency_key=args.idempotency_key,
+                    require_approval_gate=not args.skip_approval_gate,
+                    bypass_reason=args.bypass_reason,
+                    venue_name=args.venue_name,
+                    reservation_name=args.reservation_name,
+                    party_size=args.party_size,
+                    requested_time=args.requested_time,
+                    acceptable_window=args.acceptable_window,
                 ),
                 indent=2,
                 sort_keys=True,
             )
         )
+        return 0
+    if args.cmd == "call-status":
+        print(json.dumps(get_call_status(args.call_id, env_file), indent=2, sort_keys=True))
         return 0
     raise AssertionError(args.cmd)
 
